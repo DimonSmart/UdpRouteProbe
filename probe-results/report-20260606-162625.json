@@ -1,0 +1,187 @@
+{
+  "Server": "127.0.0.1:9000",
+  "ClientId": "home-pc",
+  "LocalEndpoint": "127.0.0.1:59659",
+  "ObservedEndpoint": "127.0.0.1:59659",
+  "HandshakeOk": true,
+  "SessionId": 4199611239668884906,
+  "Echo": {
+    "Sent": 100,
+    "Received": 100,
+    "Duplicate": 0,
+    "OutOfOrder": 0,
+    "MinRttMs": 0.4,
+    "AvgRttMs": 1,
+    "MaxRttMs": 7.6,
+    "P95RttMs": 3.2,
+    "Lost": 0,
+    "LossPercent": 0
+  },
+  "SizeSweep": [
+    {
+      "PayloadSize": 64,
+      "Sent": 50,
+      "Received": 50,
+      "AvgRttMs": 0.6,
+      "MaxRttMs": 2.8,
+      "LossPercent": 0
+    },
+    {
+      "PayloadSize": 128,
+      "Sent": 50,
+      "Received": 50,
+      "AvgRttMs": 0.8,
+      "MaxRttMs": 8.8,
+      "LossPercent": 0
+    },
+    {
+      "PayloadSize": 256,
+      "Sent": 50,
+      "Received": 50,
+      "AvgRttMs": 0.5,
+      "MaxRttMs": 1.5,
+      "LossPercent": 0
+    },
+    {
+      "PayloadSize": 512,
+      "Sent": 50,
+      "Received": 50,
+      "AvgRttMs": 0.5,
+      "MaxRttMs": 2.8,
+      "LossPercent": 0
+    },
+    {
+      "PayloadSize": 1000,
+      "Sent": 50,
+      "Received": 50,
+      "AvgRttMs": 0.7,
+      "MaxRttMs": 2.2,
+      "LossPercent": 0
+    },
+    {
+      "PayloadSize": 1200,
+      "Sent": 50,
+      "Received": 50,
+      "AvgRttMs": 0.6,
+      "MaxRttMs": 3.1,
+      "LossPercent": 0
+    },
+    {
+      "PayloadSize": 1300,
+      "Sent": 50,
+      "Received": 50,
+      "AvgRttMs": 0.6,
+      "MaxRttMs": 4.3,
+      "LossPercent": 0
+    },
+    {
+      "PayloadSize": 1400,
+      "Sent": 50,
+      "Received": 50,
+      "AvgRttMs": 0.5,
+      "MaxRttMs": 0.8,
+      "LossPercent": 0
+    },
+    {
+      "PayloadSize": 1472,
+      "Sent": 50,
+      "Received": 50,
+      "AvgRttMs": 0.6,
+      "MaxRttMs": 1.6,
+      "LossPercent": 0
+    },
+    {
+      "PayloadSize": 1500,
+      "Sent": 50,
+      "Received": 50,
+      "AvgRttMs": 0.6,
+      "MaxRttMs": 2.7,
+      "LossPercent": 0
+    },
+    {
+      "PayloadSize": 2000,
+      "Sent": 50,
+      "Received": 50,
+      "AvgRttMs": 0.5,
+      "MaxRttMs": 0.7,
+      "LossPercent": 0
+    },
+    {
+      "PayloadSize": 4096,
+      "Sent": 50,
+      "Received": 50,
+      "AvgRttMs": 0.6,
+      "MaxRttMs": 1.1,
+      "LossPercent": 0
+    },
+    {
+      "PayloadSize": 8192,
+      "Sent": 50,
+      "Received": 50,
+      "AvgRttMs": 0.7,
+      "MaxRttMs": 2.4,
+      "LossPercent": 0
+    },
+    {
+      "PayloadSize": 16384,
+      "Sent": 50,
+      "Received": 50,
+      "AvgRttMs": 0.8,
+      "MaxRttMs": 1.7,
+      "LossPercent": 0
+    },
+    {
+      "PayloadSize": 32768,
+      "Sent": 50,
+      "Received": 50,
+      "AvgRttMs": 1,
+      "MaxRttMs": 1.5,
+      "LossPercent": 0
+    },
+    {
+      "PayloadSize": 60000,
+      "Sent": 50,
+      "Received": 50,
+      "AvgRttMs": 1.8,
+      "MaxRttMs": 3.4,
+      "LossPercent": 0
+    }
+  ],
+  "Burst": [
+    {
+      "PacketCount": 100,
+      "Sent": 100,
+      "Received": 100,
+      "Duplicate": 0,
+      "OutOfOrder": 27,
+      "DurationMs": 2015.5,
+      "LossPercent": 0,
+      "ReceiveRate": 49.615480029769294
+    },
+    {
+      "PacketCount": 1000,
+      "Sent": 1000,
+      "Received": 977,
+      "Duplicate": 0,
+      "OutOfOrder": 355,
+      "DurationMs": 2063.2,
+      "LossPercent": 2.3,
+      "ReceiveRate": 473.53625436215594
+    },
+    {
+      "PacketCount": 5000,
+      "Sent": 5000,
+      "Received": 4847,
+      "Duplicate": 0,
+      "OutOfOrder": 1803,
+      "DurationMs": 2444.3,
+      "LossPercent": 3.06,
+      "ReceiveRate": 1982.9808125025568
+    }
+  ],
+  "NatTimeout": [],
+  "Push": [],
+  "RecommendedPayloadSize": 60000,
+  "RecommendedKeepAliveSeconds": 30,
+  "GeneratedAt": "2026-06-06T14:26:08.3793886Z"
+}

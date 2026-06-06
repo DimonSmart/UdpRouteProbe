@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>UdpRouteProbe.Client</AssemblyName>
+    <RootNamespace>UdpRouteProbe.Client</RootNamespace>
+  </PropertyGroup>
+
+  <!-- Shared protocol sources — compiled directly into this project -->
+  <ItemGroup>
+    <Compile Include="../Shared/Protocol/*.cs" />
+  </ItemGroup>
+
+</Project>

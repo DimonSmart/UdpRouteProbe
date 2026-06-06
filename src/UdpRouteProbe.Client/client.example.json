@@ -1,0 +1,15 @@
+{
+  "ServerHost": "1.2.3.4",
+  "ServerPort": 9000,
+  "ClientId": "home-pc",
+  "SecretKey": "ABC",
+  "LocalBindPort": 0,
+  "OutputDirectory": "probe-results",
+  "EchoPacketCount": 100,
+  "EchoPayloadSize": 256,
+  "EchoDelayMs": 20,
+  "SizeSweepPacketsPerSize": 50,
+  "SkipNatTest": false,
+  "SkipPushTest": false,
+  "ResponseTimeoutMs": 3000
+}

@@ -1,0 +1,12 @@
+{
+  "ListenHost": "0.0.0.0",
+  "ListenPort": 9000,
+  "Clients": [
+    {
+      "ClientId": "home-pc",
+      "SecretKey": "ABC"
+    }
+  ],
+  "SessionTimeoutSeconds": 300,
+  "LogLevel": "Information"
+}
