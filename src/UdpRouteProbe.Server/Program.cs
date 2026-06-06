@@ -70,6 +70,9 @@ static class Program
 
     static async Task<int> Main(string[] args)
     {
+        if (args.Contains("--mode") && args.SkipWhile(a => a != "--mode").Skip(1).FirstOrDefault() == "autoprobe")
+            return await AutoProbeServer.Run(args);
+
         string  configFile = Path.Combine(AppContext.BaseDirectory, "server.json");
         string? listenArg  = null;
 

@@ -138,6 +138,11 @@ static class Program
 
     static async Task<int> Main(string[] args)
     {
+        if (args.FirstOrDefault() == "autoprobe")
+            return await AutoProbeClient.Run(args.Skip(1).ToArray());
+        if (args.FirstOrDefault() == "compare")
+            return await AutoProbeCompare.Run(args.Skip(1).ToArray());
+
         string? configFile = null;
         string? serverArg  = null;
         string? clientId   = null;
