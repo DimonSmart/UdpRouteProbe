@@ -46,6 +46,11 @@ static class AutoProbeServer
     private static AutoProbeServerConfig Config = new();
     private static string LogPath = "";
     private static long ServerReceiveIndex;
+    private static long RawPacketCount;
+    private static long AcceptedPacketCount;
+    private static long RejectedPacketCount;
+    private static long ResponseSentCount;
+    private static readonly object ConsoleLock = new();
 
     public static async Task<int> Run(string[] args)
     {
@@ -96,6 +101,8 @@ static class AutoProbeServer
             listenHost = Config.ListenHost,
             listenPorts = Config.ListenPorts,
         });
+        Console.WriteLine($"AutoProbe log: {LogPath}");
+        Console.WriteLine($"AutoProbe clients: {string.Join(", ", Config.Clients.Select(c => c.ClientId))}");
 
         var listeners = Config.ListenPorts
             .Select(port => Task.Run(() => Listen(port, cts.Token)))
@@ -138,6 +145,7 @@ static class AutoProbeServer
 
         if (Config.LogRawPackets)
         {
+            long rawCount = Interlocked.Increment(ref RawPacketCount);
             WriteEvent(new
             {
                 eventType = "RawPacketReceived",
@@ -148,6 +156,7 @@ static class AutoProbeServer
                 first16BytesHex = first16,
                 packetHash64 = packetHash,
             });
+            ConsoleRaw(rawCount, local, remote, datagram.Length, first16, packetHash);
         }
 
         if (datagram.Length > Config.MaxDatagramSize)
@@ -214,6 +223,7 @@ static class AutoProbeServer
         }
 
         long receiveIndex = Interlocked.Increment(ref ServerReceiveIndex);
+        long acceptedCount = Interlocked.Increment(ref AcceptedPacketCount);
         WriteEvent(new
         {
             eventType = "PacketAccepted",
@@ -234,6 +244,7 @@ static class AutoProbeServer
             localEndpoint = local.ToString(),
             serverReceiveIndex = receiveIndex,
         });
+        ConsoleLine($"ACCEPT #{acceptedCount} {meta.TestId}/{meta.CaseId}/{meta.ProbeId} {decoded.Packet.MessageType} {decoded.WireFormat} payload={decoded.Payload.Length} {remote} -> {local}");
 
         if (meta.ResponseMode == AutoProbeResponseMode.NoResponse.ToString() ||
             meta.DirectionMode == AutoProbeDirectionMode.ClientToServerOnly.ToString())
@@ -273,6 +284,7 @@ static class AutoProbeServer
             try
             {
                 udp.Send(response, response.Length, remote);
+                long responseCount = Interlocked.Increment(ref ResponseSentCount);
                 WriteEvent(new
                 {
                     eventType = "ResponseSent",
@@ -289,9 +301,11 @@ static class AutoProbeServer
                     datagramSize = response.Length,
                     sendResult = "OK",
                 });
+                ConsoleLine($"TX #{responseCount} {meta.TestId}/{meta.CaseId}/{meta.ProbeId} {(decoded.Packet.MessageType == UdpRouteProbeMessageType.ClientHello ? "ServerHello" : "EchoResponse")} bytes={response.Length} {local} -> {remote}");
             }
             catch (Exception ex)
             {
+                long responseCount = Interlocked.Increment(ref ResponseSentCount);
                 WriteEvent(new
                 {
                     eventType = "ResponseSent",
@@ -307,12 +321,14 @@ static class AutoProbeServer
                     datagramSize = response.Length,
                     sendResult = ex.GetType().Name,
                 });
+                ConsoleLine($"TX #{responseCount} FAILED {meta.TestId}/{meta.CaseId}/{meta.ProbeId} bytes={response.Length} {local} -> {remote}: {ex.GetType().Name}");
             }
         });
     }
 
     private static void Reject(IPEndPoint remote, IPEndPoint local, string reason, int datagramSize, string first16, string packetHash, AutoProbeMetadata? meta)
     {
+        long rejectedCount = Interlocked.Increment(ref RejectedPacketCount);
         WriteEvent(new
         {
             eventType = "PacketRejected",
@@ -331,6 +347,8 @@ static class AutoProbeServer
             first16BytesHex = first16,
             packetHash64 = packetHash,
         });
+        string id = meta is null ? packetHash : $"{meta.TestId}/{meta.CaseId}/{meta.ProbeId}";
+        ConsoleReject(rejectedCount, reason, id, remote, local, datagramSize, first16);
     }
 
     private static async Task CleanupSessions(CancellationToken ct)
@@ -347,6 +365,24 @@ static class AutoProbeServer
                     Sessions.TryRemove(id, out _);
             }
         }
+    }
+
+    private static void ConsoleRaw(long count, IPEndPoint local, IPEndPoint remote, int size, string first16, string packetHash)
+    {
+        if (count <= 20 || count % 100 == 0)
+            ConsoleLine($"RX raw #{count} bytes={size} {remote} -> {local} hash={packetHash} first16={first16}");
+    }
+
+    private static void ConsoleReject(long count, string reason, string id, IPEndPoint remote, IPEndPoint local, int size, string first16)
+    {
+        if (count <= 20 || count % 50 == 0)
+            ConsoleLine($"REJECT #{count} reason={reason} id={id} bytes={size} {remote} -> {local} first16={first16}");
+    }
+
+    private static void ConsoleLine(string message)
+    {
+        lock (ConsoleLock)
+            Console.WriteLine($"{DateTime.UtcNow:HH:mm:ss.fff} {message}");
     }
 
     private static void WriteEvent(object value)
