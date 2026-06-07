@@ -51,6 +51,39 @@ dotnet run --project src/UdpRouteProbe.Client -- \
   --config client.json --skip-nat --skip-push
 ```
 
+## AutoProbe for hostile UDP paths
+
+`autoprobe` is the research mode for networks that may classify UDP by source
+endpoint, destination endpoint, packet size, rate, and content. It starts with
+raw random datagrams and can interleave decoy traffic before sending recognizable
+probe packets.
+
+Server:
+```bash
+UdpRouteProbe.Server --mode autoprobe --config server.json --ports 9000,9001,9002 --log-dir logs
+```
+
+Client:
+```bash
+UdpRouteProbe.Client autoprobe \
+  --server 207.180.194.130 \
+  --ports 9000,9001,9002 \
+  --client-id home-pc \
+  --secret-key "ABC" \
+  --duration 01:00:00 \
+  --decoy-targets 203.0.113.10,198.51.100.20 \
+  --decoy-ports 443,123 \
+  --output probe-results
+```
+
+Compare client and server logs after copying the server JSONL locally:
+```bash
+UdpRouteProbe.Client compare \
+  --client-log probe-results/autoprobe-client-YYYYMMDD-HHMMSS.jsonl \
+  --server-log logs/autoprobe-server-YYYYMMDD.jsonl \
+  --output probe-results/autoprobe-compare.json
+```
+
 ## Publish server for Ubuntu (single-file exe)
 
 ```bash

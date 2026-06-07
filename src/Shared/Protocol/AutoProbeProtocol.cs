@@ -54,6 +54,7 @@ public enum AutoProbePacketRole
     UsefulProbe,
     SameServerNoise,
     DecoyNoise,
+    RawGarbage,
 }
 
 public sealed class AutoProbeCase
@@ -77,6 +78,11 @@ public sealed class AutoProbeCase
     public bool DecoyEnabled { get; set; }
     public int DecoyRatio { get; set; }
     public string? InterleavingPattern { get; set; }
+    public int RawGarbageBeforeUsefulCount { get; set; }
+    public int RawGarbageAfterUsefulCount { get; set; }
+    public int RawGarbageSize { get; set; }
+    public int RawGarbageIntervalMs { get; set; }
+    public int PauseAfterRawGarbageMs { get; set; }
 }
 
 public sealed class AutoProbeMetadata
@@ -272,6 +278,11 @@ public static class AutoProbeProtocol
         testCase.DecoyEnabled,
         testCase.DecoyRatio,
         testCase.InterleavingPattern,
+        testCase.RawGarbageBeforeUsefulCount,
+        testCase.RawGarbageAfterUsefulCount,
+        testCase.RawGarbageSize,
+        testCase.RawGarbageIntervalMs,
+        testCase.PauseAfterRawGarbageMs,
     };
 
     private static byte[] PackPayload(AutoProbeMetadata metadata, byte[] payload)

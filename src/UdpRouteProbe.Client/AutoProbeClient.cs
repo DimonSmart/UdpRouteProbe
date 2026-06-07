@@ -31,6 +31,7 @@ sealed class AutoProbeCaseResult
     public int ClientReceived { get; set; }
     public int SameServerNoiseSent { get; set; }
     public int DecoySent { get; set; }
+    public int RawGarbageSent { get; set; }
     public int Duplicates { get; set; }
     public int OutOfOrder { get; set; }
     public List<double> RttsMs { get; } = [];
@@ -90,6 +91,8 @@ static class AutoProbeClient
     {
         string? configFile = null;
         string? portsArg = null;
+        string? decoyTargetsArg = null;
+        string? decoyPortsArg = null;
         string? durationArg = null;
         bool skipNat = false;
         bool skipPush = false;
@@ -105,6 +108,8 @@ static class AutoProbeClient
                 case "--config" when i + 1 < args.Length: configFile = args[++i]; break;
                 case "--server" when i + 1 < args.Length: Config.ServerHost = args[++i]; break;
                 case "--ports" when i + 1 < args.Length: portsArg = args[++i]; break;
+                case "--decoy-targets" when i + 1 < args.Length: decoyTargetsArg = args[++i]; break;
+                case "--decoy-ports" when i + 1 < args.Length: decoyPortsArg = args[++i]; break;
                 case "--client-id" when i + 1 < args.Length: Config.ClientId = args[++i]; break;
                 case "--secret-key" when i + 1 < args.Length: Config.SecretKey = args[++i]; break;
                 case "--duration" when i + 1 < args.Length: durationArg = args[++i]; break;
@@ -132,6 +137,9 @@ static class AutoProbeClient
         }
 
         if (portsArg is not null) Config.ServerPorts = ParsePorts(portsArg);
+        if (decoyTargetsArg is not null) Config.DecoyTargets = ParseStringList(decoyTargetsArg);
+        if (decoyPortsArg is not null) Config.DecoyPorts = ParsePorts(decoyPortsArg);
+        if (Config.DecoyTargets.Count > 0) Config.EnableDecoyTargets = true;
         if (durationArg is not null) Config.Duration = TimeSpan.Parse(durationArg, CultureInfo.InvariantCulture);
         if (Config.ServerPorts.Count == 0) Config.ServerPorts.Add(Config.ServerPort);
         if (quick)
@@ -172,24 +180,26 @@ static class AutoProbeClient
         });
 
         var results = new List<AutoProbeCaseResult>();
+        var warnings = new List<string>();
+        await RunOpeningTraffic(cts.Token);
         var reachable = await RunPreflight(cts.Token);
         if (reachable.Count == 0)
         {
-            var emptySummary = CreateSummary(started, reachable, results, ["udp-unreachable"], ["No reachable UDP server ports."]);
-            SaveSummary(emptySummary, stamp, results);
-            Console.WriteLine("No reachable UDP server ports.");
-            return 2;
+            warnings.Add("No client-observed UDP replies during preflight; continuing because server raw logs can still prove client-to-server delivery.");
+            Console.WriteLine("No client-observed UDP replies during preflight; continuing with server-observed probes.");
         }
 
+        var portsForCases = Config.ServerPorts;
         var cases = new List<AutoProbeCase>();
-        cases.AddRange(GeneratePairwiseCases(reachable, maxCases, maxPacketSize));
-        cases.AddRange(GenerateThresholdCases(reachable, maxPacketSize));
-        cases.AddRange(GenerateSizeSweepCases(reachable, maxPacketSize));
-        cases.AddRange(GenerateRateCases(reachable, maxPacketSize));
-        cases.AddRange(GenerateDirectionCases(reachable, skipPush, maxPacketSize));
-        if (!skipNat) cases.AddRange(GenerateRecoveryCases(reachable, maxPacketSize));
-        if (!skipNoise) cases.AddRange(GenerateNoiseCases(reachable, maxPacketSize));
-        cases.AddRange(GenerateStableCases(reachable, maxPacketSize));
+        cases.AddRange(GenerateServerObservedCases(portsForCases, maxPacketSize));
+        cases.AddRange(GeneratePairwiseCases(portsForCases, maxCases, maxPacketSize));
+        cases.AddRange(GenerateThresholdCases(portsForCases, maxPacketSize));
+        cases.AddRange(GenerateSizeSweepCases(portsForCases, maxPacketSize));
+        cases.AddRange(GenerateRateCases(portsForCases, maxPacketSize));
+        cases.AddRange(GenerateDirectionCases(portsForCases, skipPush, maxPacketSize));
+        if (!skipNat) cases.AddRange(GenerateRecoveryCases(portsForCases, maxPacketSize));
+        if (!skipNoise) cases.AddRange(GenerateNoiseCases(portsForCases, maxPacketSize));
+        cases.AddRange(GenerateStableCases(portsForCases, maxPacketSize));
 
         foreach (AutoProbeCase testCase in cases)
         {
@@ -208,7 +218,7 @@ static class AutoProbeClient
         }
 
         List<string> classifications = Classify(results, reachable);
-        var summary = CreateSummary(started, reachable, results, classifications, []);
+        var summary = CreateSummary(started, reachable, results, classifications, warnings);
         SaveSummary(summary, stamp, results);
         Console.WriteLine($"AutoProbe complete. Log: {ClientLogPath}");
         return 0;
@@ -231,6 +241,14 @@ static class AutoProbeClient
                 SendIntervalMs = 50,
                 SocketMode = nameof(AutoProbeSocketMode.FreshSocket),
                 ResponseMode = nameof(AutoProbeResponseMode.ImmediateEcho),
+                DecoyEnabled = Config.EnableDecoyTargets,
+                DecoyRatio = Config.EnableDecoyTargets ? 1 : 0,
+                RawGarbageBeforeUsefulCount = 2,
+                RawGarbageAfterUsefulCount = 1,
+                RawGarbageSize = 96,
+                RawGarbageIntervalMs = 25,
+                PauseAfterRawGarbageMs = 50,
+                InterleavingPattern = "RawGarbageAndDecoyBeforeHandshake",
             };
             AutoProbeCaseResult result = await RunCase(testCase, ct, firstPacketHello: true);
             if (result.ClientReceived > 0)
@@ -238,6 +256,67 @@ static class AutoProbeClient
             Console.WriteLine($"Port {port}: {(result.ClientReceived > 0 ? "handshake OK" : "handshake FAILED")} ({result.ClientReceived}/{result.ClientSent})");
         }
         return reachable;
+    }
+
+    private static async Task RunOpeningTraffic(CancellationToken ct)
+    {
+        WriteEvent(new
+        {
+            eventType = "CaseStarted",
+            process = "client",
+            runId = RunId,
+            clientId = Config.ClientId,
+            testId = "opening-camouflage",
+            caseId = "opening-0001",
+            parameters = new
+            {
+                serverPorts = Config.ServerPorts,
+                decoyTargets = Config.DecoyTargets,
+                decoyPorts = Config.DecoyPorts,
+                packetRole = AutoProbePacketRole.RawGarbage.ToString(),
+            },
+        });
+
+        IPAddress serverAddress = (await Dns.GetHostAddressesAsync(Config.ServerHost, ct))[0];
+        var mainTargets = Config.ServerPorts
+            .Select(port => new IPEndPoint(serverAddress, port))
+            .ToList();
+        var decoyTargets = await ResolveDecoyTargets(ct);
+
+        using var udp = new UdpClient(0);
+        int[] sizes = [48, 96, 256, 1200, 64, 1400, 512, 32];
+        for (int i = 0; i < sizes.Length && !ct.IsCancellationRequested; i++)
+        {
+            bool sendDecoy = decoyTargets.Count > 0 && i % 2 == 0;
+            IPEndPoint target = sendDecoy
+                ? decoyTargets[i % decoyTargets.Count]
+                : mainTargets[i % mainTargets.Count];
+            byte[] garbage = AutoProbeProtocol.CreatePayload(
+                AutoProbePayloadProfile.RandomCrypto,
+                sizes[i],
+                $"{RunId}:opening:{i}");
+
+            udp.Send(garbage, garbage.Length, target);
+            WriteEvent(new
+            {
+                eventType = "PacketSent",
+                process = "client",
+                runId = RunId,
+                clientId = Config.ClientId,
+                testId = "opening-camouflage",
+                caseId = "opening-0001",
+                probeId = $"opening-raw-{i + 1:000000}",
+                packetRole = sendDecoy ? AutoProbePacketRole.DecoyNoise.ToString() : AutoProbePacketRole.RawGarbage.ToString(),
+                targetRole = sendDecoy ? "DecoyTarget" : "MainServer",
+                remoteEndpoint = target.ToString(),
+                localEndpoint = udp.Client.LocalEndPoint?.ToString(),
+                datagramSize = garbage.Length,
+                packetHash64 = AutoProbeProtocol.PacketHash64(garbage),
+                first16BytesHex = AutoProbeProtocol.First16Hex(garbage),
+            });
+
+            await Task.Delay(i % 3 == 0 ? 100 : 25, ct);
+        }
     }
 
     private static async Task<AutoProbeCaseResult> RunCase(AutoProbeCase testCase, CancellationToken ct, bool firstPacketHello = true)
@@ -257,7 +336,6 @@ static class AutoProbeClient
         IPAddress serverAddress = (await Dns.GetHostAddressesAsync(Config.ServerHost, ct))[0];
         var server = new IPEndPoint(serverAddress, testCase.ServerPort);
         using var udp = new UdpClient(0);
-        udp.Connect(server);
         ulong sessionId = unchecked((ulong)Random.Shared.NextInt64());
         var sentTicks = new Dictionary<ulong, long>();
         var received = new HashSet<ulong>();
@@ -265,6 +343,16 @@ static class AutoProbeClient
 
         for (int i = 0; i < testCase.PacketCount && !ct.IsCancellationRequested; i++)
         {
+            if (testCase.RawGarbageBeforeUsefulCount > 0)
+            {
+                await SendRawGarbagePackets(udp, server, testCase, i, "BeforeUseful", testCase.RawGarbageBeforeUsefulCount, result, ct);
+                if (testCase.PauseAfterRawGarbageMs > 0)
+                    await Task.Delay(testCase.PauseAfterRawGarbageMs, ct);
+            }
+
+            if (Config.EnableDecoyTargets && testCase.DecoyEnabled && testCase.DecoyRatio > 0)
+                await SendDecoyPackets(udp, testCase, i, "BeforeUseful", result, ct);
+
             ulong seq = (ulong)Interlocked.Increment(ref Sequence);
             long packetId = Interlocked.Increment(ref PacketId);
             string probeId = $"{testCase.CaseId}-{i + 1:000000}";
@@ -294,15 +382,18 @@ static class AutoProbeClient
                 Key);
 
             sentTicks[seq] = Stopwatch.GetTimestamp();
-            udp.Send(datagram, datagram.Length);
+            udp.Send(datagram, datagram.Length, server);
             result.ClientSent++;
             LogSent(testCase, meta, udp, server, datagram, payload.Length, "UsefulProbe", "MainServer");
 
             if (testCase.NoiseEnabled && testCase.DecoyRatio > 0)
                 SendSameServerNoise(udp, server, testCase, i, result);
 
+            if (testCase.RawGarbageAfterUsefulCount > 0)
+                await SendRawGarbagePackets(udp, server, testCase, i, "AfterUseful", testCase.RawGarbageAfterUsefulCount, result, ct);
+
             if (Config.EnableDecoyTargets && testCase.DecoyEnabled && testCase.DecoyRatio > 0)
-                await SendDecoyPackets(testCase, i, result, ct);
+                await SendDecoyPackets(udp, testCase, i, "AfterUseful", result, ct);
 
             if (testCase.SendIntervalMs > 0 && i < testCase.PacketCount - 1)
                 await Task.Delay(testCase.SendIntervalMs, ct);
@@ -360,6 +451,10 @@ static class AutoProbeClient
                 {
                     break;
                 }
+                catch (SocketException ex) when (IsUdpUnreachable(ex))
+                {
+                    break;
+                }
             }
         }
 
@@ -396,7 +491,7 @@ static class AutoProbeClient
         for (int n = 0; n < testCase.DecoyRatio; n++)
         {
             byte[] noise = AutoProbeProtocol.CreatePayload(AutoProbePayloadProfile.RandomCrypto, Math.Max(16, testCase.NoiseSize), $"{testCase.CaseId}:noise:{packetIndex}:{n}");
-            udp.Send(noise, noise.Length);
+            udp.Send(noise, noise.Length, server);
             result.SameServerNoiseSent++;
             WriteEvent(new
             {
@@ -418,7 +513,57 @@ static class AutoProbeClient
         }
     }
 
-    private static async Task SendDecoyPackets(AutoProbeCase testCase, int packetIndex, AutoProbeCaseResult result, CancellationToken ct)
+    private static async Task SendRawGarbagePackets(
+        UdpClient udp,
+        IPEndPoint server,
+        AutoProbeCase testCase,
+        int packetIndex,
+        string placement,
+        int count,
+        AutoProbeCaseResult result,
+        CancellationToken ct)
+    {
+        int size = Math.Max(1, testCase.RawGarbageSize);
+        for (int n = 0; n < count; n++)
+        {
+            byte[] garbage = AutoProbeProtocol.CreatePayload(
+                AutoProbePayloadProfile.RandomCrypto,
+                size,
+                $"{RunId}:{testCase.CaseId}:raw-garbage:{packetIndex}:{placement}:{n}");
+
+            udp.Send(garbage, garbage.Length, server);
+            result.RawGarbageSent++;
+            WriteEvent(new
+            {
+                eventType = "PacketSent",
+                process = "client",
+                runId = RunId,
+                clientId = Config.ClientId,
+                testCase.TestId,
+                testCase.CaseId,
+                probeId = $"{testCase.CaseId}-raw-{placement.ToLowerInvariant()}-{packetIndex:000000}-{n}",
+                packetRole = AutoProbePacketRole.RawGarbage.ToString(),
+                rawGarbagePlacement = placement,
+                targetRole = "MainServer",
+                remoteEndpoint = server.ToString(),
+                localEndpoint = udp.Client.LocalEndPoint?.ToString(),
+                datagramSize = garbage.Length,
+                packetHash64 = AutoProbeProtocol.PacketHash64(garbage),
+                first16BytesHex = AutoProbeProtocol.First16Hex(garbage),
+            });
+
+            if (testCase.RawGarbageIntervalMs > 0 && n < count - 1)
+                await Task.Delay(testCase.RawGarbageIntervalMs, ct);
+        }
+    }
+
+    private static async Task SendDecoyPackets(
+        UdpClient udp,
+        AutoProbeCase testCase,
+        int packetIndex,
+        string placement,
+        AutoProbeCaseResult result,
+        CancellationToken ct)
     {
         if (Config.DecoyTargets.Count == 0) return;
         int count = Config.AllowHighDecoyRate ? testCase.DecoyRatio : Math.Min(testCase.DecoyRatio, 1);
@@ -426,10 +571,9 @@ static class AutoProbeClient
         {
             string target = Config.DecoyTargets[(packetIndex + i) % Config.DecoyTargets.Count];
             int port = Config.DecoyPorts.Count > 0 ? Config.DecoyPorts[(packetIndex + i) % Config.DecoyPorts.Count] : testCase.ServerPort;
-            using var udp = new UdpClient(0);
             var endpoint = new IPEndPoint((await Dns.GetHostAddressesAsync(target, ct))[0], port);
             byte[] datagram = AutoProbeProtocol.CreatePayload(AutoProbePayloadProfile.RandomCrypto, Math.Max(32, testCase.PayloadSize), $"{RunId}:decoy:{packetIndex}:{i}");
-            await udp.SendAsync(datagram, endpoint, ct);
+            udp.Send(datagram, datagram.Length, endpoint);
             result.DecoySent++;
             WriteEvent(new
             {
@@ -439,8 +583,9 @@ static class AutoProbeClient
                 clientId = Config.ClientId,
                 testCase.TestId,
                 testCase.CaseId,
-                probeId = $"{testCase.CaseId}-decoy-{packetIndex:000000}-{i}",
+                probeId = $"{testCase.CaseId}-decoy-{placement.ToLowerInvariant()}-{packetIndex:000000}-{i}",
                 packetRole = "DecoyNoise",
+                decoyPlacement = placement,
                 targetRole = "DecoyTarget",
                 remoteEndpoint = endpoint.ToString(),
                 localEndpoint = udp.Client.LocalEndPoint?.ToString(),
@@ -477,6 +622,22 @@ static class AutoProbeClient
             packetHash64 = AutoProbeProtocol.PacketHash64(datagram),
             first16BytesHex = AutoProbeProtocol.First16Hex(datagram),
         });
+    }
+
+    private static async Task<List<IPEndPoint>> ResolveDecoyTargets(CancellationToken ct)
+    {
+        var endpoints = new List<IPEndPoint>();
+        for (int i = 0; i < Config.DecoyTargets.Count; i++)
+        {
+            string host = Config.DecoyTargets[i];
+            int port = Config.DecoyPorts.Count > 0
+                ? Config.DecoyPorts[i % Config.DecoyPorts.Count]
+                : Config.ServerPorts[i % Config.ServerPorts.Count];
+            IPAddress[] addresses = await Dns.GetHostAddressesAsync(host, ct);
+            if (addresses.Length > 0)
+                endpoints.Add(new IPEndPoint(addresses[0], port));
+        }
+        return endpoints;
     }
 
     private static List<AutoProbeCase> GeneratePairwiseCases(List<int> ports, int maxCases, int maxPacketSize)
@@ -520,6 +681,49 @@ static class AutoProbeClient
             }
         }
         return cases;
+    }
+
+    private static IEnumerable<AutoProbeCase> GenerateServerObservedCases(List<int> ports, int maxPacketSize)
+    {
+        int[] sizes = [32, 64, 128, 256, 512, 1000, 1200, 1400, 1472, 1500, 2000, 4096, 8192, 16384];
+        int[] intervals = [0, 25, 100, 500, 1000, 5000];
+        int index = 0;
+
+        foreach (int port in ports)
+        foreach (int size in sizes.Where(s => s <= maxPacketSize))
+        {
+            int interval = intervals[index % intervals.Length];
+            var observed = Baseline("server-observed-size-port", $"obs-{index + 1:0000}", port, size, 8, interval);
+            observed.DirectionMode = nameof(AutoProbeDirectionMode.ClientToServerOnly);
+            observed.ResponseMode = nameof(AutoProbeResponseMode.NoResponse);
+            observed.WireFormat = index % 3 == 0
+                ? nameof(AutoProbeWireFormat.LegacyUrp1)
+                : index % 3 == 1 ? nameof(AutoProbeWireFormat.RandomPrefixUrp1) : nameof(AutoProbeWireFormat.NoMagicMinimal);
+            observed.PayloadProfile = index % 2 == 0
+                ? nameof(AutoProbePayloadProfile.RandomCrypto)
+                : nameof(AutoProbePayloadProfile.RepeatedPattern);
+            yield return observed;
+            index++;
+        }
+
+        int garbageIndex = 0;
+        foreach (int port in ports)
+        foreach (int garbageSize in new[] { 32, 64, 256, 1200, 1400, 1500, 4096 }.Where(s => s <= maxPacketSize))
+        foreach (int pauseMs in new[] { 0, 100, 1000, 5000 })
+        {
+            var garbage = Baseline("raw-garbage-interleaving", $"garbage-{garbageIndex + 1:0000}", port, Math.Min(256, maxPacketSize), 6, Math.Max(100, pauseMs));
+            garbage.DirectionMode = nameof(AutoProbeDirectionMode.ClientToServerOnly);
+            garbage.ResponseMode = nameof(AutoProbeResponseMode.NoResponse);
+            garbage.PayloadProfile = nameof(AutoProbePayloadProfile.RandomCrypto);
+            garbage.RawGarbageBeforeUsefulCount = 1;
+            garbage.RawGarbageAfterUsefulCount = 1;
+            garbage.RawGarbageSize = garbageSize;
+            garbage.RawGarbageIntervalMs = pauseMs;
+            garbage.PauseAfterRawGarbageMs = pauseMs;
+            garbage.InterleavingPattern = $"RawGarbageBeforeAndAfterUseful_Pause{pauseMs}ms";
+            yield return garbage;
+            garbageIndex++;
+        }
     }
 
     private static IEnumerable<AutoProbeCase> GenerateThresholdCases(List<int> ports, int maxPacketSize)
@@ -670,7 +874,7 @@ static class AutoProbeClient
         File.WriteAllText(jsonPath, JsonSerializer.Serialize(summary, new JsonSerializerOptions(JsonOptions) { WriteIndented = true }));
 
         var sb = new StringBuilder();
-        sb.AppendLine("runId,testId,caseId,serverPort,wireFormat,payloadProfile,payloadSize,sendIntervalMs,packetCount,socketMode,responseMode,noiseEnabled,noisePlacement,noiseSize,noiseProfile,decoyEnabled,decoyRatio,interleavingPattern,clientSent,serverReceived,serverRejected,serverResponded,clientReceived,clientToServerLossPercent,serverToClientLossPercent,rttMinMs,rttAvgMs,rttMaxMs,rttP95Ms,firstLossAtSequence,lastSuccessfulSequence,classification");
+        sb.AppendLine("runId,testId,caseId,serverPort,wireFormat,payloadProfile,payloadSize,sendIntervalMs,packetCount,socketMode,responseMode,noiseEnabled,noisePlacement,noiseSize,noiseProfile,decoyEnabled,decoyRatio,interleavingPattern,rawGarbageBeforeUsefulCount,rawGarbageAfterUsefulCount,rawGarbageSize,rawGarbageIntervalMs,pauseAfterRawGarbageMs,clientSent,sameServerNoiseSent,rawGarbageSent,decoySent,serverReceived,serverRejected,serverResponded,clientReceived,clientToServerLossPercent,serverToClientLossPercent,rttMinMs,rttAvgMs,rttMaxMs,rttP95Ms,firstLossAtSequence,lastSuccessfulSequence,classification");
         foreach (AutoProbeCaseResult r in results)
         {
             double rttMin = r.RttsMs.Count > 0 ? r.RttsMs.Min() : 0;
@@ -680,8 +884,10 @@ static class AutoProbeClient
                 Csv(RunId), Csv(r.Case.TestId), Csv(r.Case.CaseId), r.Case.ServerPort, Csv(r.Case.WireFormat), Csv(r.Case.PayloadProfile),
                 r.Case.PayloadSize, r.Case.SendIntervalMs, r.Case.PacketCount, Csv(r.Case.SocketMode), Csv(r.Case.ResponseMode),
                 r.Case.NoiseEnabled, Csv(r.Case.NoisePlacement ?? ""), r.Case.NoiseSize, Csv(r.Case.NoiseProfile ?? ""),
-                r.Case.DecoyEnabled, r.Case.DecoyRatio, Csv(r.Case.InterleavingPattern ?? ""), r.ClientSent,
-                "", "", "", r.ClientReceived, "", "", Math.Round(rttMin, 1), Math.Round(rttAvg, 1), Math.Round(rttMax, 1),
+                r.Case.DecoyEnabled, r.Case.DecoyRatio, Csv(r.Case.InterleavingPattern ?? ""),
+                r.Case.RawGarbageBeforeUsefulCount, r.Case.RawGarbageAfterUsefulCount, r.Case.RawGarbageSize,
+                r.Case.RawGarbageIntervalMs, r.Case.PauseAfterRawGarbageMs, r.ClientSent, r.SameServerNoiseSent,
+                r.RawGarbageSent, r.DecoySent, "", "", "", r.ClientReceived, "", "", Math.Round(rttMin, 1), Math.Round(rttAvg, 1), Math.Round(rttMax, 1),
                 Percentile(r.RttsMs, 0.95), r.FirstLossAtSequence, r.LastSuccessfulSequence, Csv(r.Classification)));
         }
         File.WriteAllText(csvPath, sb.ToString());
@@ -719,7 +925,13 @@ static class AutoProbeClient
     }
 
     private static TimeSpan Remaining(CancellationTokenSource cts) => cts.Token.IsCancellationRequested ? TimeSpan.Zero : DeadlineUtc - DateTime.UtcNow;
+    private static bool IsUdpUnreachable(SocketException ex)
+        => ex.SocketErrorCode is SocketError.ConnectionReset
+            or SocketError.ConnectionRefused
+            or SocketError.HostUnreachable
+            or SocketError.NetworkUnreachable;
     private static List<int> ParsePorts(string value) => value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(int.Parse).Distinct().ToList();
+    private static List<string> ParseStringList(string value) => value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
     private static double Percentile(List<double> values, double percentile) => values.Count == 0 ? 0 : Math.Round(values.Order().ElementAt(Math.Min(values.Count - 1, (int)(values.Count * percentile))), 1);
     private static string Csv(string value) => "\"" + value.Replace("\"", "\"\"") + "\"";
 }

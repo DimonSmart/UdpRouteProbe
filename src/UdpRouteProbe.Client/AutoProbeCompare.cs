@@ -11,9 +11,11 @@ sealed class CompareProbeState
     public string PacketRole { get; set; } = "UsefulProbe";
     public bool ClientSent { get; set; }
     public bool ServerReceived { get; set; }
+    public bool ServerRawReceived { get; set; }
     public bool ServerRejected { get; set; }
     public bool ServerResponded { get; set; }
     public bool ClientReceived { get; set; }
+    public string PacketHash64 { get; set; } = "";
     public string State { get; set; } = "";
 }
 
@@ -59,6 +61,7 @@ static class AutoProbeCompare
         }
 
         var probes = new Dictionary<string, CompareProbeState>(StringComparer.Ordinal);
+        var probesByPacketHash = new Dictionary<string, CompareProbeState>(StringComparer.OrdinalIgnoreCase);
         string runId = "";
         var caseParameters = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
 
@@ -79,15 +82,34 @@ static class AutoProbeCompare
             CompareProbeState p = GetProbe(probes, probeId, e);
             if (eventType == "PacketSent") p.ClientSent = true;
             if (eventType == "PacketReceived") p.ClientReceived = true;
+            string packetHash = GetString(e, "packetHash64");
+            if (packetHash.Length > 0)
+            {
+                p.PacketHash64 = packetHash;
+                probesByPacketHash[packetHash] = p;
+            }
         });
 
         await ReadLog(serverLog, e =>
         {
             string probeId = GetString(e, "probeId");
-            if (probeId.Length == 0) return;
-            CompareProbeState p = GetProbe(probes, probeId, e);
+            CompareProbeState? p;
+            if (probeId.Length == 0)
+            {
+                string packetHash = GetString(e, "packetHash64");
+                if (packetHash.Length == 0 || !probesByPacketHash.TryGetValue(packetHash, out p))
+                    return;
+            }
+            else
+            {
+                p = GetProbe(probes, probeId, e);
+            }
+
             switch (GetString(e, "eventType"))
             {
+                case "RawPacketReceived":
+                    p.ServerRawReceived = true;
+                    break;
                 case "PacketAccepted":
                     p.ServerReceived = true;
                     break;
@@ -109,6 +131,7 @@ static class AutoProbeCompare
             var items = g.ToList();
             int clientSent = items.Count(p => p.ClientSent && p.PacketRole == "UsefulProbe");
             int serverReceived = items.Count(p => p.ServerReceived && p.PacketRole == "UsefulProbe");
+            int serverRawReceived = items.Count(p => p.ServerRawReceived);
             int serverResponded = items.Count(p => p.ServerResponded && p.PacketRole == "UsefulProbe");
             int clientReceived = items.Count(p => p.ClientReceived && p.PacketRole == "UsefulProbe");
             int sameServerNoiseSent = items.Count(p => p.ClientSent && p.PacketRole == "SameServerNoise");
@@ -122,6 +145,7 @@ static class AutoProbeCompare
                 parameters,
                 clientSent,
                 serverReceived,
+                serverRawReceived,
                 serverResponded,
                 clientReceived,
                 sameServerNoiseSent,
@@ -138,6 +162,7 @@ static class AutoProbeCompare
             runId,
             totalClientSent = useful.Count(p => p.ClientSent),
             serverReceived = useful.Count(p => p.ServerReceived),
+            serverRawReceived = probes.Values.Count(p => p.ServerRawReceived),
             serverRejected = useful.Count(p => p.ServerRejected),
             serverResponded = useful.Count(p => p.ServerResponded),
             clientReceived = useful.Count(p => p.ClientReceived),
@@ -182,6 +207,8 @@ static class AutoProbeCompare
     private static string Classify(CompareProbeState p)
     {
         if (p.PacketRole == "DecoyNoise") return "NotApplicable_DecoyTarget";
+        if (p.PacketRole == "RawGarbage" && p.ServerRawReceived) return "RawGarbage_ServerReceived";
+        if (p.PacketRole == "RawGarbage" && p.ClientSent && !p.ServerRawReceived) return "RawGarbage_ServerDidNotReceive";
         if (p.ServerRejected) return "ServerRejected";
         if (p.ClientSent && !p.ServerReceived) return "ClientSent_ServerDidNotReceive";
         if (p.ServerReceived && !p.ServerResponded) return "ServerReceived_ClientDidNotReceiveResponse";
