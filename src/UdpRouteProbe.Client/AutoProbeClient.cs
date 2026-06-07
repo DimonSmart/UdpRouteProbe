@@ -201,15 +201,24 @@ static class AutoProbeClient
         if (!skipNoise) cases.AddRange(GenerateNoiseCases(portsForCases, maxPacketSize));
         cases.AddRange(GenerateStableCases(portsForCases, maxPacketSize));
 
+        Console.WriteLine($"Running {cases.Count} AutoProbe cases until {DeadlineUtc:O} UTC.");
+        int completedCases = 0;
         foreach (AutoProbeCase testCase in cases)
         {
             if (cts.IsCancellationRequested || Remaining(cts) < TimeSpan.FromSeconds(2))
                 break;
             if (testCase.CaseStartDelayMs > 0)
+            {
+                Console.WriteLine($"Waiting {testCase.CaseStartDelayMs}ms before {testCase.CaseId} ({testCase.TestId})...");
                 await Task.Delay(TimeSpan.FromMilliseconds(Math.Min(testCase.CaseStartDelayMs, Remaining(cts).TotalMilliseconds)), cts.Token);
+            }
             try
             {
-                results.Add(await RunCase(testCase, cts.Token));
+                Console.WriteLine(FormatCaseStart(testCase, completedCases + 1, cases.Count));
+                AutoProbeCaseResult result = await RunCase(testCase, cts.Token);
+                results.Add(result);
+                completedCases++;
+                Console.WriteLine(FormatCaseResult(result, completedCases, cases.Count));
             }
             catch (OperationCanceledException)
             {
@@ -220,7 +229,7 @@ static class AutoProbeClient
         List<string> classifications = Classify(results, reachable);
         var summary = CreateSummary(started, reachable, results, classifications, warnings);
         SaveSummary(summary, stamp, results);
-        Console.WriteLine($"AutoProbe complete. Log: {ClientLogPath}");
+        Console.WriteLine($"AutoProbe complete. Cases completed: {completedCases}/{cases.Count}. Log: {ClientLogPath}");
         return 0;
     }
 
@@ -340,6 +349,7 @@ static class AutoProbeClient
         var sentTicks = new Dictionary<ulong, long>();
         var received = new HashSet<ulong>();
         ulong maxReceived = 0;
+        DateTime nextProgressUtc = DateTime.UtcNow.AddSeconds(5);
 
         for (int i = 0; i < testCase.PacketCount && !ct.IsCancellationRequested; i++)
         {
@@ -397,12 +407,19 @@ static class AutoProbeClient
 
             if (testCase.SendIntervalMs > 0 && i < testCase.PacketCount - 1)
                 await Task.Delay(testCase.SendIntervalMs, ct);
+
+            if (DateTime.UtcNow >= nextProgressUtc && i < testCase.PacketCount - 1)
+            {
+                Console.WriteLine($"    {testCase.CaseId}: sent {i + 1}/{testCase.PacketCount}, useful={result.ClientSent}, raw={result.RawGarbageSent}, decoy={result.DecoySent}");
+                nextProgressUtc = DateTime.UtcNow.AddSeconds(5);
+            }
         }
 
         if (testCase.ResponseMode != nameof(AutoProbeResponseMode.NoResponse) &&
             testCase.DirectionMode != nameof(AutoProbeDirectionMode.ClientToServerOnly))
         {
             long deadline = Stopwatch.GetTimestamp() + Stopwatch.Frequency * 2;
+            Console.WriteLine($"    {testCase.CaseId}: waiting for responses...");
             while (Stopwatch.GetTimestamp() < deadline && received.Count < result.ClientSent)
             {
                 int timeoutMs = Math.Max(1, (int)((deadline - Stopwatch.GetTimestamp()) * 1000 / Stopwatch.Frequency));
@@ -808,6 +825,24 @@ static class AutoProbeClient
             SocketMode = nameof(AutoProbeSocketMode.FreshSocket),
             ResponseMode = nameof(AutoProbeResponseMode.ImmediateEcho),
         };
+
+    private static string FormatCaseStart(AutoProbeCase testCase, int index, int total)
+    {
+        string extras = "";
+        if (testCase.RawGarbageBeforeUsefulCount > 0 || testCase.RawGarbageAfterUsefulCount > 0)
+            extras += $" raw={testCase.RawGarbageBeforeUsefulCount}+{testCase.RawGarbageAfterUsefulCount}x{testCase.RawGarbageSize}";
+        if (testCase.DecoyEnabled)
+            extras += $" decoyRatio={testCase.DecoyRatio}";
+        return $"[{index}/{total}] {testCase.TestId}/{testCase.CaseId}: port={testCase.ServerPort} wire={testCase.WireFormat} payload={testCase.PayloadProfile}/{testCase.PayloadSize} count={testCase.PacketCount} interval={testCase.SendIntervalMs}ms response={testCase.ResponseMode}{extras}";
+    }
+
+    private static string FormatCaseResult(AutoProbeCaseResult result, int index, int total)
+    {
+        string rtt = result.RttsMs.Count == 0
+            ? "rtt=n/a"
+            : $"rtt(avg/p95)={Math.Round(result.RttsMs.Average(), 1)}/{Percentile(result.RttsMs, 0.95)}ms";
+        return $"[{index}/{total}] {result.Case.CaseId} done: useful {result.ClientReceived}/{result.ClientSent}, loss={Math.Round(result.LossPercent, 1)}%, raw={result.RawGarbageSent}, decoy={result.DecoySent}, {rtt}, {result.Classification}";
+    }
 
     private static List<string> Classify(List<AutoProbeCaseResult> results, List<int> reachable)
     {
