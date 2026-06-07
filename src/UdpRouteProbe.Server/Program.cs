@@ -12,6 +12,7 @@ namespace UdpRouteProbe.Server;
 
 sealed class ServerConfig
 {
+    public string            Mode                  { get; set; } = "server";
     public string            ListenHost            { get; set; } = "0.0.0.0";
     public int               ListenPort            { get; set; } = 9000;
     public List<ClientEntry> Clients               { get; set; } = [];
@@ -70,11 +71,9 @@ static class Program
 
     static async Task<int> Main(string[] args)
     {
-        if (args.Contains("--mode") && args.SkipWhile(a => a != "--mode").Skip(1).FirstOrDefault() == "autoprobe")
-            return await AutoProbeServer.Run(args);
-
         string  configFile = Path.Combine(AppContext.BaseDirectory, "server.json");
         string? listenArg  = null;
+        string? modeArg    = null;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -82,9 +81,14 @@ static class Program
             {
                 case "--config"  when i + 1 < args.Length: configFile = args[++i]; break;
                 case "--listen"  when i + 1 < args.Length: listenArg  = args[++i]; break;
+                case "--mode"    when i + 1 < args.Length: modeArg    = args[++i]; break;
                 case "--verbose" or "-v":                   _verbose   = true;       break;
             }
         }
+
+        string? configuredMode = modeArg ?? await ReadConfiguredMode(configFile);
+        if (string.Equals(configuredMode, "autoprobe", StringComparison.OrdinalIgnoreCase))
+            return await AutoProbeServer.Run(args);
 
         if (File.Exists(configFile))
         {
@@ -135,6 +139,21 @@ static class Program
 
         await ReceiveLoop(cts.Token);
         return 0;
+    }
+
+    static async Task<string?> ReadConfiguredMode(string configFile)
+    {
+        if (!File.Exists(configFile))
+            return null;
+
+        using JsonDocument doc = JsonDocument.Parse(await File.ReadAllTextAsync(configFile));
+        foreach (JsonProperty property in doc.RootElement.EnumerateObject())
+        {
+            if (string.Equals(property.Name, "Mode", StringComparison.OrdinalIgnoreCase))
+                return property.Value.GetString();
+        }
+
+        return null;
     }
 
     // ── Receive loop ─────────────────────────────────────────────────────────

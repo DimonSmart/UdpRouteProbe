@@ -1,6 +1,8 @@
 {
+  "Mode": "autoprobe",
   "ListenHost": "0.0.0.0",
   "ListenPort": 9000,
+  "ListenPorts": [9000, 9001, 9002],
   "Clients": [
     {
       "ClientId": "home-pc",
@@ -8,5 +10,8 @@
     }
   ],
   "SessionTimeoutSeconds": 300,
-  "LogLevel": "Information"
+  "LogLevel": "Information",
+  "AutoProbeLogDirectory": "logs",
+  "LogRawPackets": true,
+  "MaxDatagramSize": 65507
 }

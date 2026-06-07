@@ -58,7 +58,32 @@ endpoint, destination endpoint, packet size, rate, and content. It starts with
 raw random datagrams and can interleave decoy traffic before sending recognizable
 probe packets.
 
+Server config (`server.json` next to the executable):
+```json
+{
+  "Mode": "autoprobe",
+  "ListenHost": "0.0.0.0",
+  "ListenPort": 9000,
+  "ListenPorts": [9000, 9001, 9002],
+  "Clients": [
+    {
+      "ClientId": "home-pc",
+      "SecretKey": "ABC"
+    }
+  ],
+  "SessionTimeoutSeconds": 300,
+  "AutoProbeLogDirectory": "logs",
+  "LogRawPackets": true,
+  "MaxDatagramSize": 65507
+}
+```
+
 Server:
+```bash
+UdpRouteProbe.Server
+```
+
+The command-line form still works and overrides the configured ports:
 ```bash
 UdpRouteProbe.Server --mode autoprobe --config server.json --ports 9000,9001,9002 --log-dir logs
 ```

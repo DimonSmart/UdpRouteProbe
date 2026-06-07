@@ -11,6 +11,7 @@ namespace UdpRouteProbe.Server;
 
 sealed class AutoProbeServerConfig
 {
+    public string Mode { get; set; } = "autoprobe";
     public string ListenHost { get; set; } = "0.0.0.0";
     public int ListenPort { get; set; } = 9000;
     public List<int> ListenPorts { get; set; } = [];
