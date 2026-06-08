@@ -167,7 +167,7 @@ static class AutoProbeServer
 
         if (!AutoProbeProtocol.TryPeekClientIdHash(datagram, out ulong clientIdHash) || !Clients.TryGetValue(clientIdHash, out ClientEntry? client))
         {
-            Reject(remote, local, "UnknownClientIdHash", datagram.Length, first16, packetHash, null);
+            Reject(remote, local, datagram.Length > 0 && datagram[0] == (byte)'{' ? "UnknownJsonClientIdHash" : "UnknownClientIdHash", datagram.Length, first16, packetHash, null);
             return;
         }
 
@@ -218,7 +218,7 @@ static class AutoProbeServer
         }
         else
         {
-            Reject(remote, local, "UnknownSession", datagram.Length, first16, packetHash, meta);
+            Reject(remote, local, decoded.WireFormat == AutoProbeWireFormat.JsonText.ToString() ? "InvalidJsonSession" : "UnknownSession", datagram.Length, first16, packetHash, meta);
             return;
         }
 
@@ -246,6 +246,12 @@ static class AutoProbeServer
         });
         ConsoleLine($"ACCEPT #{acceptedCount} {meta.TestId}/{meta.CaseId}/{meta.ProbeId} {decoded.Packet.MessageType} {decoded.WireFormat} payload={decoded.Payload.Length} {remote} -> {local}");
 
+        if (decoded.Packet.MessageType != UdpRouteProbeMessageType.ClientHello &&
+            (meta.ResponseMode == AutoProbeResponseMode.SparseEcho.ToString() &&
+             meta.RespondEveryN > 1 &&
+             decoded.Packet.Sequence % (ulong)meta.RespondEveryN != 0))
+            return;
+
         if (meta.ResponseMode == AutoProbeResponseMode.NoResponse.ToString() ||
             meta.DirectionMode == AutoProbeDirectionMode.ClientToServerOnly.ToString())
             return;
@@ -272,9 +278,10 @@ static class AutoProbeServer
                 ResponseMode = meta.ResponseMode,
                 DirectionMode = meta.DirectionMode,
             };
+            byte[] responsePayload = BuildResponsePayload(meta, decoded.Payload);
             byte[] response = AutoProbeProtocol.BuildDatagram(
                 responseMeta,
-                decoded.Payload,
+                responsePayload,
                 decoded.Packet.ClientIdHash,
                 sessionId,
                 decoded.Packet.MessageType == UdpRouteProbeMessageType.ClientHello
@@ -299,6 +306,7 @@ static class AutoProbeServer
                     remoteEndpoint = remote.ToString(),
                     localEndpoint = local.ToString(),
                     datagramSize = response.Length,
+                    payloadSize = responsePayload.Length,
                     sendResult = "OK",
                 });
                 ConsoleLine($"TX #{responseCount} {meta.TestId}/{meta.CaseId}/{meta.ProbeId} {(decoded.Packet.MessageType == UdpRouteProbeMessageType.ClientHello ? "ServerHello" : "EchoResponse")} bytes={response.Length} {local} -> {remote}");
@@ -319,11 +327,29 @@ static class AutoProbeServer
                     remoteEndpoint = remote.ToString(),
                     localEndpoint = local.ToString(),
                     datagramSize = response.Length,
+                    payloadSize = responsePayload.Length,
                     sendResult = ex.GetType().Name,
                 });
                 ConsoleLine($"TX #{responseCount} FAILED {meta.TestId}/{meta.CaseId}/{meta.ProbeId} bytes={response.Length} {local} -> {remote}: {ex.GetType().Name}");
             }
         });
+    }
+
+    private static byte[] BuildResponsePayload(AutoProbeMetadata meta, byte[] requestPayload)
+    {
+        return meta.ResponsePayloadMode switch
+        {
+            nameof(AutoProbeResponsePayloadMode.HeaderOnlyAck) => [],
+            nameof(AutoProbeResponsePayloadMode.SmallAck) => AutoProbeProtocol.CreatePayload(
+                AutoProbePayloadProfile.AsciiText,
+                meta.ResponsePayloadSize > 0 ? meta.ResponsePayloadSize : 32,
+                $"{meta.RunId}:{meta.CaseId}:{meta.ProbeId}:small-ack"),
+            nameof(AutoProbeResponsePayloadMode.FixedSize) => AutoProbeProtocol.CreatePayload(
+                AutoProbePayloadProfile.RandomFixedSeed,
+                Math.Max(0, meta.ResponsePayloadSize),
+                $"{meta.RunId}:{meta.CaseId}:{meta.ProbeId}:fixed-response"),
+            _ => requestPayload,
+        };
     }
 
     private static void Reject(IPEndPoint remote, IPEndPoint local, string reason, int datagramSize, string first16, string packetHash, AutoProbeMetadata? meta)

@@ -28,6 +28,10 @@ sealed class AutoProbeCaseResult
 {
     public required AutoProbeCase Case { get; init; }
     public int ClientSent { get; set; }
+    public int ServerRawReceived { get; set; }
+    public int ServerAccepted { get; set; }
+    public int ServerRejected { get; set; }
+    public int ServerResponded { get; set; }
     public int ClientReceived { get; set; }
     public int SameServerNoiseSent { get; set; }
     public int DecoySent { get; set; }
@@ -38,6 +42,12 @@ sealed class AutoProbeCaseResult
     public int FirstLossAtSequence { get; set; }
     public int LastSuccessfulSequence { get; set; }
     public double LossPercent => ClientSent > 0 ? 100.0 * (ClientSent - ClientReceived) / ClientSent : 0;
+    public bool ExpectsResponse => AutoProbeClient.ExpectsResponse(Case);
+    public double? ClientToServerRawLossPercent => ServerRawReceived > 0 || ClientSent > 0 ? AutoProbeClient.Percent(ClientSent - ServerRawReceived, ClientSent) : null;
+    public double? ServerRejectPercent => ServerRawReceived > 0 ? AutoProbeClient.Percent(ServerRejected, ServerRawReceived) : null;
+    public double? ServerAcceptedButNoResponsePercent => ServerAccepted > 0 ? AutoProbeClient.Percent(ServerAccepted - ServerResponded, ServerAccepted) : null;
+    public double? ServerToClientResponseLossPercent => ExpectsResponse && ServerResponded > 0 ? AutoProbeClient.Percent(ServerResponded - ClientReceived, ServerResponded) : null;
+    public double? EndToEndSuccessPercent => ExpectsResponse && ClientSent > 0 ? AutoProbeClient.Percent(ClientReceived, ClientSent) : null;
     public string Classification { get; set; } = "";
 }
 
@@ -192,6 +202,7 @@ static class AutoProbeClient
         var portsForCases = Config.ServerPorts;
         var cases = new List<AutoProbeCase>();
         cases.AddRange(GenerateServerObservedCases(portsForCases, maxPacketSize));
+        cases.AddRange(GenerateBidirectionalIsolationCases(portsForCases, maxPacketSize));
         cases.AddRange(GeneratePairwiseCases(portsForCases, maxCases, maxPacketSize));
         cases.AddRange(GenerateThresholdCases(portsForCases, maxPacketSize));
         cases.AddRange(GenerateSizeSweepCases(portsForCases, maxPacketSize));
@@ -345,11 +356,21 @@ static class AutoProbeClient
         IPAddress serverAddress = (await Dns.GetHostAddressesAsync(Config.ServerHost, ct))[0];
         var server = new IPEndPoint(serverAddress, testCase.ServerPort);
         using var udp = new UdpClient(0);
-        ulong sessionId = unchecked((ulong)Random.Shared.NextInt64());
+        ulong sessionId;
         var sentTicks = new Dictionary<ulong, long>();
         var received = new HashSet<ulong>();
+        var sentDataSequences = new List<ulong>();
         ulong maxReceived = 0;
         DateTime nextProgressUtc = DateTime.UtcNow.AddSeconds(5);
+
+        (bool handshakeOk, ulong establishedSessionId) = await RunHandshake(udp, server, testCase, ct);
+        if (!handshakeOk)
+        {
+            result.Classification = "handshake-barrier-failed";
+            WriteCaseCompleted(testCase, result);
+            return result;
+        }
+        sessionId = establishedSessionId;
 
         for (int i = 0; i < testCase.PacketCount && !ct.IsCancellationRequested; i++)
         {
@@ -382,16 +403,20 @@ static class AutoProbeClient
                 PacketRole = AutoProbePacketRole.UsefulProbe.ToString(),
                 ResponseMode = testCase.ResponseMode,
                 DirectionMode = testCase.DirectionMode,
+                ResponsePayloadMode = testCase.ResponsePayloadMode,
+                ResponsePayloadSize = testCase.ResponsePayloadSize,
+                RespondEveryN = testCase.RespondEveryN,
             };
             byte[] datagram = AutoProbeProtocol.BuildDatagram(
                 meta,
                 payload,
                 ClientIdHash,
                 sessionId,
-                firstPacketHello && i == 0 ? UdpRouteProbeMessageType.ClientHello : UdpRouteProbeMessageType.EchoRequest,
+                UdpRouteProbeMessageType.EchoRequest,
                 Key);
 
             sentTicks[seq] = Stopwatch.GetTimestamp();
+            sentDataSequences.Add(seq);
             udp.Send(datagram, datagram.Length, server);
             result.ClientSent++;
             LogSent(testCase, meta, udp, server, datagram, payload.Length, "UsefulProbe", "MainServer");
@@ -415,12 +440,12 @@ static class AutoProbeClient
             }
         }
 
-        if (testCase.ResponseMode != nameof(AutoProbeResponseMode.NoResponse) &&
-            testCase.DirectionMode != nameof(AutoProbeDirectionMode.ClientToServerOnly))
+        if (ExpectsResponse(testCase))
         {
             long deadline = Stopwatch.GetTimestamp() + Stopwatch.Frequency * 2;
             Console.WriteLine($"    {testCase.CaseId}: waiting for responses...");
-            while (Stopwatch.GetTimestamp() < deadline && received.Count < result.ClientSent)
+            int expectedResponses = sentDataSequences.Count(seq => ShouldExpectResponse(testCase, seq));
+            while (Stopwatch.GetTimestamp() < deadline && received.Count < expectedResponses)
             {
                 int timeoutMs = Math.Max(1, (int)((deadline - Stopwatch.GetTimestamp()) * 1000 / Stopwatch.Frequency));
                 using var timeout = new CancellationTokenSource(timeoutMs);
@@ -475,13 +500,109 @@ static class AutoProbeClient
             }
         }
 
-        if (result.ClientReceived < result.ClientSent)
-            result.FirstLossAtSequence = Enumerable.Range(1, result.ClientSent).FirstOrDefault(n => !received.Contains((ulong)n));
+        if (ExpectsResponse(testCase) && result.ClientReceived < sentDataSequences.Count(seq => ShouldExpectResponse(testCase, seq)))
+            result.FirstLossAtSequence = (int)(sentDataSequences.FirstOrDefault(seq => ShouldExpectResponse(testCase, seq) && !received.Contains(seq)));
 
-        result.Classification = result.ClientReceived == result.ClientSent
-            ? "success"
-            : result.ClientReceived == 0 ? "server-to-client-or-client-to-server-loss" : "partial-loss";
+        result.Classification = ClassifyCaseResult(result);
 
+        WriteCaseCompleted(testCase, result);
+        return result;
+    }
+
+    private static async Task<(bool Ok, ulong SessionId)> RunHandshake(UdpClient udp, IPEndPoint server, AutoProbeCase testCase, CancellationToken ct)
+    {
+        ulong seq = (ulong)Interlocked.Increment(ref Sequence);
+        long packetId = Interlocked.Increment(ref PacketId);
+        string probeId = $"{testCase.CaseId}-handshake";
+        var meta = new AutoProbeMetadata
+        {
+            RunId = RunId,
+            ClientId = Config.ClientId,
+            TestId = testCase.TestId,
+            CaseId = testCase.CaseId,
+            ProbeId = probeId,
+            PacketId = packetId,
+            Sequence = seq,
+            PayloadProfile = nameof(AutoProbePayloadProfile.AsciiText),
+            WireFormat = testCase.WireFormat,
+            PacketRole = AutoProbePacketRole.Handshake.ToString(),
+            ResponseMode = nameof(AutoProbeResponseMode.ImmediateEcho),
+            DirectionMode = nameof(AutoProbeDirectionMode.ClientToServerWithEcho),
+            ResponsePayloadMode = nameof(AutoProbeResponsePayloadMode.HeaderOnlyAck),
+        };
+        byte[] payload = Encoding.ASCII.GetBytes("autoprobe-handshake");
+        byte[] datagram = AutoProbeProtocol.BuildDatagram(meta, payload, ClientIdHash, 0, UdpRouteProbeMessageType.ClientHello, Key);
+
+        WriteEvent(new
+        {
+            eventType = "HandshakeStarted",
+            process = "client",
+            runId = RunId,
+            clientId = Config.ClientId,
+            testCase.TestId,
+            testCase.CaseId,
+            localEndpoint = udp.Client.LocalEndPoint?.ToString(),
+            remoteEndpoint = server.ToString(),
+        });
+
+        long started = Stopwatch.GetTimestamp();
+        udp.Send(datagram, datagram.Length, server);
+        LogSent(testCase, meta, udp, server, datagram, payload.Length, AutoProbePacketRole.Handshake.ToString(), "MainServer");
+
+        long deadline = Stopwatch.GetTimestamp() + Stopwatch.Frequency * 2;
+        while (Stopwatch.GetTimestamp() < deadline)
+        {
+            int timeoutMs = Math.Max(1, (int)((deadline - Stopwatch.GetTimestamp()) * 1000 / Stopwatch.Frequency));
+            using var timeout = new CancellationTokenSource(timeoutMs);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
+            try
+            {
+                UdpReceiveResult receive = await udp.ReceiveAsync(linked.Token);
+                if (!AutoProbeProtocol.TryDecode(receive.Buffer, Key, out AutoProbeDecodedPacket? decoded, out _) || decoded is null)
+                    continue;
+                if (decoded.Packet.MessageType != UdpRouteProbeMessageType.ServerHello || decoded.Metadata.ProbeId != probeId)
+                    continue;
+
+                double rttMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
+                WriteEvent(new
+                {
+                    eventType = "HandshakeCompleted",
+                    process = "client",
+                    runId = RunId,
+                    clientId = Config.ClientId,
+                    testCase.TestId,
+                    testCase.CaseId,
+                    sessionId = decoded.Packet.SessionId.ToString("x16"),
+                    observedEndpoint = receive.RemoteEndPoint.ToString(),
+                    rttMs = Math.Round(rttMs, 1),
+                });
+                return (true, decoded.Packet.SessionId);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (SocketException ex) when (IsUdpUnreachable(ex))
+            {
+                break;
+            }
+        }
+
+        WriteEvent(new
+        {
+            eventType = "HandshakeFailed",
+            process = "client",
+            runId = RunId,
+            clientId = Config.ClientId,
+            testCase.TestId,
+            testCase.CaseId,
+            reason = "Timeout",
+        });
+        return (false, 0);
+    }
+
+    private static void WriteCaseCompleted(AutoProbeCase testCase, AutoProbeCaseResult result)
+    {
         WriteEvent(new
         {
             eventType = "CaseCompleted",
@@ -491,16 +612,18 @@ static class AutoProbeClient
             testCase.TestId,
             testCase.CaseId,
             sent = result.ClientSent,
-            received = result.ClientReceived,
-            lossPercent = Math.Round(result.LossPercent, 1),
+            received = result.ExpectsResponse ? result.ClientReceived : (int?)null,
+            expectsResponse = result.ExpectsResponse,
+            lossPercent = result.ExpectsResponse ? Math.Round(result.LossPercent, 1) : (double?)null,
+            endToEndSuccessPercent = result.EndToEndSuccessPercent,
             duplicates = result.Duplicates,
             outOfOrder = result.OutOfOrder,
             rttMinMs = result.RttsMs.Count > 0 ? Math.Round(result.RttsMs.Min(), 1) : 0,
             rttAvgMs = result.RttsMs.Count > 0 ? Math.Round(result.RttsMs.Average(), 1) : 0,
             rttMaxMs = result.RttsMs.Count > 0 ? Math.Round(result.RttsMs.Max(), 1) : 0,
             rttP95Ms = Percentile(result.RttsMs, 0.95),
+            result.Classification,
         });
-        return result;
     }
 
     private static void SendSameServerNoise(UdpClient udp, IPEndPoint server, AutoProbeCase testCase, int packetIndex, AutoProbeCaseResult result)
@@ -713,6 +836,7 @@ static class AutoProbeClient
             var observed = Baseline("server-observed-size-port", $"obs-{index + 1:0000}", port, size, 8, interval);
             observed.DirectionMode = nameof(AutoProbeDirectionMode.ClientToServerOnly);
             observed.ResponseMode = nameof(AutoProbeResponseMode.NoResponse);
+            observed.ExpectsResponse = false;
             observed.WireFormat = index % 3 == 0
                 ? nameof(AutoProbeWireFormat.LegacyUrp1)
                 : index % 3 == 1 ? nameof(AutoProbeWireFormat.RandomPrefixUrp1) : nameof(AutoProbeWireFormat.NoMagicMinimal);
@@ -731,6 +855,7 @@ static class AutoProbeClient
             var garbage = Baseline("raw-garbage-interleaving", $"garbage-{garbageIndex + 1:0000}", port, Math.Min(256, maxPacketSize), 6, Math.Max(100, pauseMs));
             garbage.DirectionMode = nameof(AutoProbeDirectionMode.ClientToServerOnly);
             garbage.ResponseMode = nameof(AutoProbeResponseMode.NoResponse);
+            garbage.ExpectsResponse = false;
             garbage.PayloadProfile = nameof(AutoProbePayloadProfile.RandomCrypto);
             garbage.RawGarbageBeforeUsefulCount = 1;
             garbage.RawGarbageAfterUsefulCount = 1;
@@ -740,6 +865,54 @@ static class AutoProbeClient
             garbage.InterleavingPattern = $"RawGarbageBeforeAndAfterUseful_Pause{pauseMs}ms";
             yield return garbage;
             garbageIndex++;
+        }
+    }
+
+    private static IEnumerable<AutoProbeCase> GenerateBidirectionalIsolationCases(List<int> ports, int maxPacketSize)
+    {
+        int port = ports[0];
+        int payload256 = Math.Min(256, maxPacketSize);
+
+        AutoProbeCase a = Baseline("bidirectional-isolation", "bidi-0001-client-to-server-only", port, payload256, 50, 100);
+        a.DirectionMode = nameof(AutoProbeDirectionMode.ClientToServerOnly);
+        a.ResponseMode = nameof(AutoProbeResponseMode.NoResponse);
+        a.ExpectsResponse = false;
+        yield return a;
+
+        AutoProbeCase b = Baseline("bidirectional-isolation", "bidi-0002-immediate-same-size", port, payload256, 50, 100);
+        b.ResponsePayloadMode = nameof(AutoProbeResponsePayloadMode.SameAsRequest);
+        yield return b;
+
+        AutoProbeCase c = Baseline("bidirectional-isolation", "bidi-0003-immediate-small-ack", port, payload256, 50, 100);
+        c.ResponsePayloadMode = nameof(AutoProbeResponsePayloadMode.SmallAck);
+        c.ResponsePayloadSize = 32;
+        yield return c;
+
+        AutoProbeCase d = Baseline("bidirectional-isolation", "bidi-0004-immediate-header-only", port, payload256, 50, 100);
+        d.ResponsePayloadMode = nameof(AutoProbeResponsePayloadMode.HeaderOnlyAck);
+        yield return d;
+
+        AutoProbeCase e = Baseline("bidirectional-isolation", "bidi-0005-delayed-100ms", port, payload256, 50, 100);
+        e.ResponseMode = nameof(AutoProbeResponseMode.DelayedEcho100ms);
+        yield return e;
+
+        AutoProbeCase f = Baseline("bidirectional-isolation", "bidi-0006-delayed-1000ms", port, payload256, 20, 500);
+        f.ResponseMode = nameof(AutoProbeResponseMode.DelayedEcho1000ms);
+        yield return f;
+
+        AutoProbeCase g = Baseline("bidirectional-isolation", "bidi-0007-sparse-echo", port, payload256, 100, 100);
+        g.ResponseMode = nameof(AutoProbeResponseMode.SparseEcho);
+        g.RespondEveryN = 5;
+        yield return g;
+
+        int reverseIndex = 0;
+        foreach (int responseSize in new[] { 32, 64, 256, 512, 1000, 1200, 1400, 1600, 2000 }.Where(s => s <= maxPacketSize))
+        {
+            AutoProbeCase h = Baseline("bidirectional-isolation", $"bidi-010{reverseIndex}-reverse-size-{responseSize}", port, Math.Min(64, maxPacketSize), 30, 100);
+            h.ResponsePayloadMode = nameof(AutoProbeResponsePayloadMode.FixedSize);
+            h.ResponsePayloadSize = responseSize;
+            yield return h;
+            reverseIndex++;
         }
     }
 
@@ -762,6 +935,7 @@ static class AutoProbeClient
         AutoProbeCase clientToServerOnly = Baseline("directionality", "dir-0001", ports[0], Math.Min(256, maxPacketSize), 20, 50);
         clientToServerOnly.DirectionMode = nameof(AutoProbeDirectionMode.ClientToServerOnly);
         clientToServerOnly.ResponseMode = nameof(AutoProbeResponseMode.NoResponse);
+        clientToServerOnly.ExpectsResponse = false;
         yield return clientToServerOnly;
         yield return Baseline("directionality", "dir-0002", ports[0], Math.Min(256, maxPacketSize), 20, 50);
         if (!skipPush)
@@ -824,6 +998,8 @@ static class AutoProbeClient
             SendIntervalMs = interval,
             SocketMode = nameof(AutoProbeSocketMode.FreshSocket),
             ResponseMode = nameof(AutoProbeResponseMode.ImmediateEcho),
+            ExpectsResponse = true,
+            ResponsePayloadMode = nameof(AutoProbeResponsePayloadMode.SameAsRequest),
         };
 
     private static string FormatCaseStart(AutoProbeCase testCase, int index, int total)
@@ -833,7 +1009,7 @@ static class AutoProbeClient
             extras += $" raw={testCase.RawGarbageBeforeUsefulCount}+{testCase.RawGarbageAfterUsefulCount}x{testCase.RawGarbageSize}";
         if (testCase.DecoyEnabled)
             extras += $" decoyRatio={testCase.DecoyRatio}";
-        return $"[{index}/{total}] {testCase.TestId}/{testCase.CaseId}: port={testCase.ServerPort} wire={testCase.WireFormat} payload={testCase.PayloadProfile}/{testCase.PayloadSize} count={testCase.PacketCount} interval={testCase.SendIntervalMs}ms response={testCase.ResponseMode}{extras}";
+        return $"[{index}/{total}] {testCase.TestId}/{testCase.CaseId}: port={testCase.ServerPort} wire={testCase.WireFormat} payload={testCase.PayloadProfile}/{testCase.PayloadSize} count={testCase.PacketCount} interval={testCase.SendIntervalMs}ms response={testCase.ResponseMode} expectsResponse={ExpectsResponse(testCase)}{extras}";
     }
 
     private static string FormatCaseResult(AutoProbeCaseResult result, int index, int total)
@@ -841,7 +1017,28 @@ static class AutoProbeClient
         string rtt = result.RttsMs.Count == 0
             ? "rtt=n/a"
             : $"rtt(avg/p95)={Math.Round(result.RttsMs.Average(), 1)}/{Percentile(result.RttsMs, 0.95)}ms";
-        return $"[{index}/{total}] {result.Case.CaseId} done: useful {result.ClientReceived}/{result.ClientSent}, loss={Math.Round(result.LossPercent, 1)}%, raw={result.RawGarbageSent}, decoy={result.DecoySent}, {rtt}, {result.Classification}";
+        string received = result.ExpectsResponse ? result.ClientReceived.ToString(CultureInfo.InvariantCulture) : "not expected";
+        string success = result.EndToEndSuccessPercent is null ? "e2e=n/a" : $"e2e={Math.Round(result.EndToEndSuccessPercent.Value, 1)}%";
+        return $"[{index}/{total}] {result.Case.CaseId} done: useful {received}/{result.ClientSent}, {success}, raw={result.RawGarbageSent}, decoy={result.DecoySent}, {rtt}, {result.Classification}";
+    }
+
+    internal static bool ExpectsResponse(AutoProbeCase testCase)
+        => testCase.ExpectsResponse &&
+           testCase.ResponseMode != nameof(AutoProbeResponseMode.NoResponse) &&
+           testCase.DirectionMode != nameof(AutoProbeDirectionMode.ClientToServerOnly);
+
+    private static bool ShouldExpectResponse(AutoProbeCase testCase, ulong sequence)
+        => ExpectsResponse(testCase) &&
+           (testCase.ResponseMode != nameof(AutoProbeResponseMode.SparseEcho) ||
+            testCase.RespondEveryN <= 1 ||
+            sequence % (ulong)testCase.RespondEveryN == 0);
+
+    private static string ClassifyCaseResult(AutoProbeCaseResult result)
+    {
+        if (!result.ExpectsResponse)
+            return result.ClientSent > 0 ? "client-to-server-pending-server-log-noresponse" : "client-to-server-no-data";
+        if (result.ClientReceived == result.ClientSent) return "success";
+        return result.ClientReceived == 0 ? "server-to-client-or-client-to-server-loss" : "partial-loss";
     }
 
     private static List<string> Classify(List<AutoProbeCaseResult> results, List<int> reachable)
@@ -875,11 +1072,24 @@ static class AutoProbeClient
         List<object> best = typedBest.Cast<object>().ToList();
 
         object recommendations = typedBest.Count == 0
-            ? new { safePayloadSize = "unknown", suggestedKeepAliveSeconds = "unknown" }
+            ? new
+            {
+                safePayloadSize = new
+                {
+                    value = "unknown",
+                    confidence = "unknown",
+                    reason = "No successful response-observed cases were completed.",
+                },
+                suggestedKeepAliveSeconds = new { value = "unknown", confidence = "unknown" },
+            }
             : new
             {
-                safePayloadSize = "unknown",
-                reason = "AutoProbe reports observed best cases only; safe size requires corroborated size-sweep evidence.",
+                safePayloadSize = new
+                {
+                    value = "unknown",
+                    confidence = "unknown",
+                    reason = "Client-only AutoProbe summary cannot prove server raw receipt, parser acceptance, or isolated size sweep success. Use compare output with server logs for a confident safe payload size.",
+                },
                 bestObservedPort = typedBest[0].ServerPort,
                 bestObservedPayloadProfile = typedBest[0].PayloadProfile,
                 bestObservedWireFormat = typedBest[0].WireFormat,
@@ -909,7 +1119,7 @@ static class AutoProbeClient
         File.WriteAllText(jsonPath, JsonSerializer.Serialize(summary, new JsonSerializerOptions(JsonOptions) { WriteIndented = true }));
 
         var sb = new StringBuilder();
-        sb.AppendLine("runId,testId,caseId,serverPort,wireFormat,payloadProfile,payloadSize,sendIntervalMs,packetCount,socketMode,responseMode,noiseEnabled,noisePlacement,noiseSize,noiseProfile,decoyEnabled,decoyRatio,interleavingPattern,rawGarbageBeforeUsefulCount,rawGarbageAfterUsefulCount,rawGarbageSize,rawGarbageIntervalMs,pauseAfterRawGarbageMs,clientSent,sameServerNoiseSent,rawGarbageSent,decoySent,serverReceived,serverRejected,serverResponded,clientReceived,clientToServerLossPercent,serverToClientLossPercent,rttMinMs,rttAvgMs,rttMaxMs,rttP95Ms,firstLossAtSequence,lastSuccessfulSequence,classification");
+        sb.AppendLine("runId,testId,caseId,serverPort,wireFormat,payloadProfile,payloadSize,sendIntervalMs,packetCount,socketMode,responseMode,expectsResponse,responsePayloadMode,responsePayloadSize,respondEveryN,noiseEnabled,noisePlacement,noiseSize,noiseProfile,decoyEnabled,decoyRatio,interleavingPattern,rawGarbageBeforeUsefulCount,rawGarbageAfterUsefulCount,rawGarbageSize,rawGarbageIntervalMs,pauseAfterRawGarbageMs,clientSent,serverRawReceived,serverAccepted,serverRejected,serverResponded,clientReceived,clientToServerRawLossPercent,serverRejectPercent,serverAcceptedButNoResponsePercent,serverToClientResponseLossPercent,endToEndSuccessPercent,sameServerNoiseSent,rawGarbageSent,decoySent,rttMinMs,rttAvgMs,rttMaxMs,rttP95Ms,firstLossAtSequence,lastSuccessfulSequence,classification");
         foreach (AutoProbeCaseResult r in results)
         {
             double rttMin = r.RttsMs.Count > 0 ? r.RttsMs.Min() : 0;
@@ -918,11 +1128,13 @@ static class AutoProbeClient
             sb.AppendLine(string.Join(',',
                 Csv(RunId), Csv(r.Case.TestId), Csv(r.Case.CaseId), r.Case.ServerPort, Csv(r.Case.WireFormat), Csv(r.Case.PayloadProfile),
                 r.Case.PayloadSize, r.Case.SendIntervalMs, r.Case.PacketCount, Csv(r.Case.SocketMode), Csv(r.Case.ResponseMode),
+                r.ExpectsResponse, Csv(r.Case.ResponsePayloadMode), r.Case.ResponsePayloadSize, r.Case.RespondEveryN,
                 r.Case.NoiseEnabled, Csv(r.Case.NoisePlacement ?? ""), r.Case.NoiseSize, Csv(r.Case.NoiseProfile ?? ""),
                 r.Case.DecoyEnabled, r.Case.DecoyRatio, Csv(r.Case.InterleavingPattern ?? ""),
                 r.Case.RawGarbageBeforeUsefulCount, r.Case.RawGarbageAfterUsefulCount, r.Case.RawGarbageSize,
-                r.Case.RawGarbageIntervalMs, r.Case.PauseAfterRawGarbageMs, r.ClientSent, r.SameServerNoiseSent,
-                r.RawGarbageSent, r.DecoySent, "", "", "", r.ClientReceived, "", "", Math.Round(rttMin, 1), Math.Round(rttAvg, 1), Math.Round(rttMax, 1),
+                r.Case.RawGarbageIntervalMs, r.Case.PauseAfterRawGarbageMs, r.ClientSent, "", "", "", "", r.ExpectsResponse ? r.ClientReceived.ToString(CultureInfo.InvariantCulture) : "",
+                "", "", "", "", r.EndToEndSuccessPercent is null ? "" : Math.Round(r.EndToEndSuccessPercent.Value, 1).ToString(CultureInfo.InvariantCulture),
+                r.SameServerNoiseSent, r.RawGarbageSent, r.DecoySent, Math.Round(rttMin, 1), Math.Round(rttAvg, 1), Math.Round(rttMax, 1),
                 Percentile(r.RttsMs, 0.95), r.FirstLossAtSequence, r.LastSuccessfulSequence, Csv(r.Classification)));
         }
         File.WriteAllText(csvPath, sb.ToString());
@@ -968,5 +1180,7 @@ static class AutoProbeClient
     private static List<int> ParsePorts(string value) => value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(int.Parse).Distinct().ToList();
     private static List<string> ParseStringList(string value) => value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
     private static double Percentile(List<double> values, double percentile) => values.Count == 0 ? 0 : Math.Round(values.Order().ElementAt(Math.Min(values.Count - 1, (int)(values.Count * percentile))), 1);
+    internal static double Percent(int numerator, int denominator)
+        => denominator > 0 ? Math.Round(100.0 * numerator / denominator, 1) : 0;
     private static string Csv(string value) => "\"" + value.Replace("\"", "\"\"") + "\"";
 }

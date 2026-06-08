@@ -39,7 +39,16 @@ public enum AutoProbeResponseMode
     ImmediateEcho,
     DelayedEcho100ms,
     DelayedEcho1000ms,
+    SparseEcho,
     NoResponse,
+}
+
+public enum AutoProbeResponsePayloadMode
+{
+    SameAsRequest,
+    SmallAck,
+    HeaderOnlyAck,
+    FixedSize,
 }
 
 public enum AutoProbeDirectionMode
@@ -51,6 +60,7 @@ public enum AutoProbeDirectionMode
 
 public enum AutoProbePacketRole
 {
+    Handshake,
     UsefulProbe,
     SameServerNoise,
     DecoyNoise,
@@ -83,6 +93,10 @@ public sealed class AutoProbeCase
     public int RawGarbageSize { get; set; }
     public int RawGarbageIntervalMs { get; set; }
     public int PauseAfterRawGarbageMs { get; set; }
+    public bool ExpectsResponse { get; set; } = true;
+    public string ResponsePayloadMode { get; set; } = AutoProbeResponsePayloadMode.SameAsRequest.ToString();
+    public int ResponsePayloadSize { get; set; }
+    public int RespondEveryN { get; set; }
 }
 
 public sealed class AutoProbeMetadata
@@ -102,6 +116,9 @@ public sealed class AutoProbeMetadata
     public string ResponseMode { get; set; } = AutoProbeResponseMode.ImmediateEcho.ToString();
     public string DirectionMode { get; set; } = AutoProbeDirectionMode.ClientToServerWithEcho.ToString();
     public long SendUnixMs { get; set; }
+    public string ResponsePayloadMode { get; set; } = AutoProbeResponsePayloadMode.SameAsRequest.ToString();
+    public int ResponsePayloadSize { get; set; }
+    public int RespondEveryN { get; set; }
 }
 
 public sealed class AutoProbeDecodedPacket
@@ -191,7 +208,7 @@ public static class AutoProbeProtocol
         if (UdpRouteProbePacketCodec.TryPeekClientIdHash(datagram, out clientIdHash))
             return true;
 
-        if (datagram.Length > 1 && UdpRouteProbePacketCodec.TryPeekClientIdHash(datagram[1..], out clientIdHash))
+        if (TryPeekRandomPrefixClientIdHash(datagram, out clientIdHash))
             return true;
 
         if (datagram.Length >= 29 && datagram[0] == NoMagicMarker[0] && datagram[1] == NoMagicMarker[1] && datagram[2] == NoMagicMarker[2])
@@ -283,6 +300,10 @@ public static class AutoProbeProtocol
         testCase.RawGarbageSize,
         testCase.RawGarbageIntervalMs,
         testCase.PauseAfterRawGarbageMs,
+        testCase.ExpectsResponse,
+        testCase.ResponsePayloadMode,
+        testCase.ResponsePayloadSize,
+        testCase.RespondEveryN,
     };
 
     private static byte[] PackPayload(AutoProbeMetadata metadata, byte[] payload)
@@ -309,12 +330,15 @@ public static class AutoProbeProtocol
 
     private static byte[] BuildRandomPrefix(UdpRouteProbePacket packet, byte[] secretKey, ulong sequence)
     {
-        int prefixLength = (int)(sequence % 4UL switch { 0 => 8UL, 1 => 16UL, 2 => 32UL, _ => 64UL });
+        int prefixLength = (int)((sequence % 4UL) switch { 0 => 8UL, 1 => 16UL, 2 => 32UL, _ => 64UL });
         byte[] legacy = UdpRouteProbePacketCodec.Encode(packet, secretKey);
+        ReadOnlySpan<byte> legacyWithoutHmac = legacy.AsSpan(0, legacy.Length - UdpRouteProbePacketCodec.HmacSize);
         byte[] datagram = new byte[1 + prefixLength + legacy.Length];
         datagram[0] = (byte)prefixLength;
         RandomNumberGenerator.Fill(datagram.AsSpan(1, prefixLength));
-        legacy.CopyTo(datagram.AsSpan(1 + prefixLength));
+        legacyWithoutHmac.CopyTo(datagram.AsSpan(1 + prefixLength));
+        byte[] hmac = new HMACSHA256(secretKey).ComputeHash(datagram.AsSpan(0, datagram.Length - UdpRouteProbePacketCodec.HmacSize).ToArray());
+        hmac.CopyTo(datagram.AsSpan(datagram.Length - UdpRouteProbePacketCodec.HmacSize));
         return datagram;
     }
 
@@ -322,18 +346,84 @@ public static class AutoProbeProtocol
     {
         decoded = null;
         rejectReason = "";
-        int prefixLength = datagram[0];
-        if (prefixLength is not (8 or 16 or 32 or 64) || datagram.Length <= 1 + prefixLength)
+        if (datagram.Length == 0)
+        {
+            rejectReason = "InvalidPrefixLength";
             return false;
+        }
 
-        if (!UdpRouteProbePacketCodec.TryDecode(datagram[(1 + prefixLength)..], secretKey, out UdpRouteProbePacket? packet) || packet is null)
+        int prefixLength = datagram[0];
+        if (prefixLength is not (8 or 16 or 32 or 64))
+        {
+            rejectReason = prefixLength > 64 ? "PrefixTooLarge" : "InvalidPrefixLength";
+            return false;
+        }
+        if (datagram.Length <= 1 + prefixLength)
+        {
+            rejectReason = "MissingLegacyPayloadAfterPrefix";
+            return false;
+        }
+
+        ReadOnlySpan<byte> inner = datagram[(1 + prefixLength)..];
+        if (!LooksLikeLegacy(inner))
+        {
+            rejectReason = "InvalidInnerMagic";
+            return false;
+        }
+        if (inner.Length < UdpRouteProbePacketCodec.MinSize)
+        {
+            rejectReason = "MissingLegacyPayloadAfterPrefix";
+            return false;
+        }
+
+        int payloadLength = BigEndianBinary.ReadUInt16(inner, 40);
+        if (inner.Length != UdpRouteProbePacketCodec.HeaderSize + payloadLength + UdpRouteProbePacketCodec.HmacSize)
+        {
+            rejectReason = "MissingLegacyPayloadAfterPrefix";
+            return false;
+        }
+
+        byte[] expected = new HMACSHA256(secretKey).ComputeHash(datagram[..^UdpRouteProbePacketCodec.HmacSize].ToArray());
+        if (!CryptographicOperations.FixedTimeEquals(expected, datagram[^UdpRouteProbePacketCodec.HmacSize..]))
         {
             rejectReason = "InvalidHmac";
             return false;
         }
 
+        var packet = new UdpRouteProbePacket
+        {
+            MessageType = (UdpRouteProbeMessageType)inner[5],
+            Flags = BigEndianBinary.ReadUInt16(inner, 6),
+            ClientIdHash = BigEndianBinary.ReadUInt64(inner, 8),
+            SessionId = BigEndianBinary.ReadUInt64(inner, 16),
+            Sequence = BigEndianBinary.ReadUInt64(inner, 24),
+            TimestampMs = BigEndianBinary.ReadUInt64(inner, 32),
+            Payload = payloadLength > 0
+                ? inner.Slice(UdpRouteProbePacketCodec.HeaderSize, payloadLength).ToArray()
+                : [],
+        };
         return TryUnpackLegacy(packet, datagram.ToArray(), nameof(AutoProbeWireFormat.RandomPrefixUrp1), out decoded, out rejectReason);
     }
+
+    private static bool TryPeekRandomPrefixClientIdHash(ReadOnlySpan<byte> datagram, out ulong clientIdHash)
+    {
+        clientIdHash = 0;
+        if (datagram.Length == 0) return false;
+        int prefixLength = datagram[0];
+        if (prefixLength is not (8 or 16 or 32 or 64)) return false;
+        ReadOnlySpan<byte> inner = datagram[(1 + prefixLength)..];
+        if (!LooksLikeLegacy(inner) || inner.Length < UdpRouteProbePacketCodec.MinSize) return false;
+        clientIdHash = BigEndianBinary.ReadUInt64(inner, 8);
+        return true;
+    }
+
+    private static bool LooksLikeLegacy(ReadOnlySpan<byte> data)
+        => data.Length >= 5 &&
+           data[0] == (byte)'U' &&
+           data[1] == (byte)'R' &&
+           data[2] == (byte)'P' &&
+           data[3] == (byte)'1' &&
+           data[4] == 1;
 
     private static bool TryUnpackLegacy(UdpRouteProbePacket packet, byte[] datagram, string wireFormat, out AutoProbeDecodedPacket? decoded, out string rejectReason)
     {
@@ -431,19 +521,9 @@ public static class AutoProbeProtocol
 
     private static byte[] BuildJsonText(AutoProbeMetadata metadata, byte[] payload, ulong clientIdHash, ulong sessionId, UdpRouteProbeMessageType messageType, byte[] secretKey)
     {
-        string payloadBase64 = Convert.ToBase64String(payload);
-        string body = JsonSerializer.Serialize(new
-        {
-            v = 1,
-            t = messageType.ToString(),
-            clientIdHash = clientIdHash.ToString("x16"),
-            sessionId,
-            metadata.Sequence,
-            m = metadata,
-            p = payloadBase64,
-        }, JsonOptions);
-        string hmac = Convert.ToBase64String(new HMACSHA256(secretKey).ComputeHash(Encoding.UTF8.GetBytes(body)));
-        return Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { body, h = hmac }, JsonOptions));
+        byte[] canonical = BuildJsonCanonical(metadata, payload, clientIdHash, sessionId, messageType, includeHmac: false, hmacBase64: null);
+        string hmac = Convert.ToBase64String(new HMACSHA256(secretKey).ComputeHash(canonical));
+        return BuildJsonCanonical(metadata, payload, clientIdHash, sessionId, messageType, includeHmac: true, hmacBase64: hmac);
     }
 
     private static bool TryDecodeJsonText(ReadOnlySpan<byte> datagram, byte[] secretKey, out AutoProbeDecodedPacket? decoded, out string rejectReason)
@@ -453,26 +533,55 @@ public static class AutoProbeProtocol
         if (datagram[0] != (byte)'{') return false;
         try
         {
-            using JsonDocument wrapper = JsonDocument.Parse(datagram.ToArray());
-            string body = wrapper.RootElement.GetProperty("body").GetString() ?? "";
-            string hmac = wrapper.RootElement.GetProperty("h").GetString() ?? "";
-            byte[] expected = new HMACSHA256(secretKey).ComputeHash(Encoding.UTF8.GetBytes(body));
-            if (!CryptographicOperations.FixedTimeEquals(expected, Convert.FromBase64String(hmac)))
+            using JsonDocument doc = JsonDocument.Parse(datagram.ToArray());
+            JsonElement root = doc.RootElement;
+            int version = RequiredInt(root, "v");
+            if (version != 1)
             {
-                rejectReason = "InvalidHmac";
+                rejectReason = "UnsupportedJsonVersion";
                 return false;
             }
 
-            using JsonDocument doc = JsonDocument.Parse(body);
-            JsonElement root = doc.RootElement;
-            AutoProbeMetadata metadata = root.GetProperty("m").Deserialize<AutoProbeMetadata>(JsonOptions) ?? new();
-            byte[] payload = Convert.FromBase64String(root.GetProperty("p").GetString() ?? "");
+            string hmac = RequiredString(root, "hmac");
+            ulong clientIdHash = Convert.ToUInt64(RequiredString(root, "clientIdHash"), 16);
+            ulong sessionId = RequiredUInt64(root, "sessionId");
+            string type = RequiredString(root, "t");
+            byte[] payload = Convert.FromBase64String(RequiredString(root, "payloadBase64"));
+            var metadata = new AutoProbeMetadata
+            {
+                SchemaVersion = version,
+                RunId = RequiredString(root, "runId"),
+                ClientId = root.TryGetProperty("clientId", out JsonElement clientIdElement) ? clientIdElement.GetString() ?? "" : "",
+                TestId = RequiredString(root, "testId"),
+                CaseId = RequiredString(root, "caseId"),
+                ProbeId = RequiredString(root, "probeId"),
+                PacketId = RequiredInt64(root, "packetId"),
+                Sequence = RequiredUInt64(root, "sequence"),
+                PayloadProfile = RequiredString(root, "payloadProfile"),
+                PayloadSize = RequiredInt(root, "payloadSize"),
+                WireFormat = nameof(AutoProbeWireFormat.JsonText),
+                PacketRole = root.TryGetProperty("packetRole", out JsonElement roleElement) ? roleElement.GetString() ?? AutoProbePacketRole.UsefulProbe.ToString() : AutoProbePacketRole.UsefulProbe.ToString(),
+                ResponseMode = RequiredString(root, "responseMode"),
+                DirectionMode = RequiredString(root, "directionMode"),
+                SendUnixMs = root.TryGetProperty("sendUnixMs", out JsonElement sendElement) ? sendElement.GetInt64() : 0,
+                ResponsePayloadMode = root.TryGetProperty("responsePayloadMode", out JsonElement responsePayloadModeElement) ? responsePayloadModeElement.GetString() ?? AutoProbeResponsePayloadMode.SameAsRequest.ToString() : AutoProbeResponsePayloadMode.SameAsRequest.ToString(),
+                ResponsePayloadSize = root.TryGetProperty("responsePayloadSize", out JsonElement responsePayloadSizeElement) ? responsePayloadSizeElement.GetInt32() : 0,
+                RespondEveryN = root.TryGetProperty("respondEveryN", out JsonElement respondEveryNElement) ? respondEveryNElement.GetInt32() : 0,
+            };
+            byte[] canonical = BuildJsonCanonical(metadata, payload, clientIdHash, sessionId, Enum.Parse<UdpRouteProbeMessageType>(type), includeHmac: false, hmacBase64: null);
+            byte[] expected = new HMACSHA256(secretKey).ComputeHash(canonical);
+            if (!CryptographicOperations.FixedTimeEquals(expected, Convert.FromBase64String(hmac)))
+            {
+                rejectReason = "InvalidJsonHmac";
+                return false;
+            }
+
             var packet = new UdpRouteProbePacket
             {
-                MessageType = Enum.Parse<UdpRouteProbeMessageType>(root.GetProperty("t").GetString() ?? nameof(UdpRouteProbeMessageType.EchoRequest)),
-                ClientIdHash = Convert.ToUInt64(root.GetProperty("clientIdHash").GetString(), 16),
-                SessionId = root.GetProperty("sessionId").GetUInt64(),
-                Sequence = root.GetProperty("sequence").GetUInt64(),
+                MessageType = Enum.Parse<UdpRouteProbeMessageType>(type),
+                ClientIdHash = clientIdHash,
+                SessionId = sessionId,
+                Sequence = metadata.Sequence,
                 TimestampMs = HmacHelper.NowMs(),
                 Payload = PackPayload(metadata, payload),
             };
@@ -488,11 +597,87 @@ public static class AutoProbeProtocol
             };
             return true;
         }
-        catch
+        catch (JsonException)
         {
-            rejectReason = "MalformedPacket";
+            rejectReason = "InvalidJson";
             return false;
         }
+        catch (KeyNotFoundException)
+        {
+            rejectReason = "MissingJsonField";
+            return false;
+        }
+        catch (FormatException)
+        {
+            rejectReason = "MissingJsonField";
+            return false;
+        }
+        catch
+        {
+            rejectReason = "InvalidJson";
+            return false;
+        }
+    }
+
+    private static byte[] BuildJsonCanonical(AutoProbeMetadata metadata, byte[] payload, ulong clientIdHash, ulong sessionId, UdpRouteProbeMessageType messageType, bool includeHmac, string? hmacBase64)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = false }))
+        {
+            writer.WriteStartObject();
+            writer.WriteNumber("v", 1);
+            writer.WriteString("t", messageType.ToString());
+            writer.WriteString("clientIdHash", clientIdHash.ToString("x16"));
+            writer.WriteNumber("sessionId", sessionId);
+            writer.WriteString("runId", metadata.RunId);
+            writer.WriteString("clientId", metadata.ClientId);
+            writer.WriteString("testId", metadata.TestId);
+            writer.WriteString("caseId", metadata.CaseId);
+            writer.WriteString("probeId", metadata.ProbeId);
+            writer.WriteNumber("packetId", metadata.PacketId);
+            writer.WriteNumber("sequence", metadata.Sequence);
+            writer.WriteString("payloadProfile", metadata.PayloadProfile);
+            writer.WriteNumber("payloadSize", payload.Length);
+            writer.WriteString("payloadBase64", Convert.ToBase64String(payload));
+            writer.WriteString("packetRole", metadata.PacketRole);
+            writer.WriteString("responseMode", metadata.ResponseMode);
+            writer.WriteString("directionMode", metadata.DirectionMode);
+            writer.WriteNumber("sendUnixMs", metadata.SendUnixMs);
+            writer.WriteString("responsePayloadMode", metadata.ResponsePayloadMode);
+            writer.WriteNumber("responsePayloadSize", metadata.ResponsePayloadSize);
+            writer.WriteNumber("respondEveryN", metadata.RespondEveryN);
+            if (includeHmac) writer.WriteString("hmac", hmacBase64);
+            writer.WriteEndObject();
+        }
+        return stream.ToArray();
+    }
+
+    private static string RequiredString(JsonElement root, string name)
+    {
+        if (!root.TryGetProperty(name, out JsonElement element) || element.ValueKind == JsonValueKind.Null)
+            throw new KeyNotFoundException(name);
+        return element.GetString() ?? "";
+    }
+
+    private static int RequiredInt(JsonElement root, string name)
+    {
+        if (!root.TryGetProperty(name, out JsonElement element))
+            throw new KeyNotFoundException(name);
+        return element.GetInt32();
+    }
+
+    private static long RequiredInt64(JsonElement root, string name)
+    {
+        if (!root.TryGetProperty(name, out JsonElement element))
+            throw new KeyNotFoundException(name);
+        return element.GetInt64();
+    }
+
+    private static ulong RequiredUInt64(JsonElement root, string name)
+    {
+        if (!root.TryGetProperty(name, out JsonElement element))
+            throw new KeyNotFoundException(name);
+        return element.GetUInt64();
     }
 
     private static void FillRepeated(byte[] target, byte[] pattern)
